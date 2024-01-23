@@ -7,13 +7,17 @@
     <parent>
         <groupId>com.tencent.trpc</groupId>
         <artifactId>trpc-parent</artifactId>
-        <version>1.1.1-SNAPSHOT</version>
+        <version>1.1.1</version>
     </parent>
 
     <artifactId>trpc-bootstrap</artifactId>
     <packaging>pom</packaging>
     <description>Trpc Parent Project ${project.version}</description>
     <name>${project.artifactId}</name>
+
+    <properties>
+        <maven.deploy.skip>true</maven.deploy.skip>
+    </properties>
 
     <modules>
         <module>trpc-server</module>

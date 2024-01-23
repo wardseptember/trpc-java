@@ -27,10 +27,10 @@
     <parent>
         <artifactId>trpc-selector</artifactId>
         <groupId>com.tencent.trpc</groupId>
-        <version>1.1.1-SNAPSHOT</version>
+        <version>1.1.1</version>
     </parent>
 
     <properties>
-        <skip_maven_deploy>false</skip_maven_deploy>
+        <maven.deploy.skip>true</maven.deploy.skip>
     </properties>
 </project>
