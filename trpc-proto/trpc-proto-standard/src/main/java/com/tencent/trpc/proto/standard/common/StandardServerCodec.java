@@ -1,7 +1,7 @@
 /*
  * Tencent is pleased to support the open source community by making tRPC available.
  *
- * Copyright (C) 2023 THL A29 Limited, a Tencent company. 
+ * Copyright (C) 2023 THL A29 Limited, a Tencent company.
  * All rights reserved.
  *
  * If you have downloaded a copy of the tRPC source code from Tencent,
@@ -41,6 +41,7 @@ import com.tencent.trpc.proto.standard.common.TRPCProtocol.ResponseProtocol;
 import com.tencent.trpc.proto.standard.common.TRPCProtocol.ResponseProtocol.Builder;
 import com.tencent.trpc.proto.standard.common.TRPCProtocol.TrpcCallType;
 import com.tencent.trpc.proto.standard.common.TRPCProtocol.TrpcMessageType;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -116,7 +117,8 @@ public class StandardServerCodec extends ServerCodec {
 
     private void fillResponseWithAttachments(Response response, Builder rawResponse) {
         response.getAttachments().forEach((k, v) -> putTransInfo(rawResponse, k, v));
-        response.getRequest().getAttachments().forEach((k, v) -> putTransInfo(rawResponse, k, v));
+        Map<String, Object> copyAttachments = new HashMap<>(response.getRequest().getAttachments());
+        copyAttachments.forEach((k, v) -> putTransInfo(rawResponse, k, v));
     }
 
     /**
