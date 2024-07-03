@@ -1,7 +1,7 @@
 /*
  * Tencent is pleased to support the open source community by making tRPC available.
  *
- * Copyright (C) 2023 THL A29 Limited, a Tencent company. 
+ * Copyright (C) 2023 THL A29 Limited, a Tencent company.
  * All rights reserved.
  *
  * If you have downloaded a copy of the tRPC source code from Tencent,
@@ -20,6 +20,7 @@ import com.tencent.trpc.core.selector.spi.Discovery;
 import com.tencent.trpc.core.utils.HelloRequestProtocol.HelloRequest;
 import java.io.IOException;
 import java.io.InputStream;
+import java.time.LocalDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -66,7 +67,7 @@ public class JsonUtilsTest {
         }
         try {
             JsonUtils.fromJson(ERROR_JSON, JsonUtils.copy().getTypeFactory().constructCollectionType(
-                            Collection.class, TestObj.class));
+                    Collection.class, TestObj.class));
         } catch (TRpcException e) {
             Assert.assertEquals(e.getCode(), 2001);
         }
@@ -181,6 +182,20 @@ public class JsonUtilsTest {
             return;
         }
         Assert.fail();
+    }
+
+    @Test
+    public void testLocalDateTime() {
+        Map<String, Object> mapValue = Maps.newHashMap();
+        mapValue.put("data", "123");
+        mapValue.put("create_time", LocalDateTime.now());
+        mapValue.put("12", 12);
+        try {
+            String json = JsonUtils.toJson(mapValue);
+            System.out.println(json);
+        } catch (Exception e) {
+            Assert.assertNull(e);
+        }
     }
 
 

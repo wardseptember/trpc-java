@@ -1,7 +1,7 @@
 /*
  * Tencent is pleased to support the open source community by making tRPC available.
  *
- * Copyright (C) 2023 THL A29 Limited, a Tencent company. 
+ * Copyright (C) 2023 THL A29 Limited, a Tencent company.
  * All rights reserved.
  *
  * If you have downloaded a copy of the tRPC source code from Tencent,
@@ -16,6 +16,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JavaType;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.tencent.trpc.core.exception.ErrorCode;
 import com.tencent.trpc.core.exception.TRpcException;
 import com.tencent.trpc.core.logger.Logger;
@@ -39,6 +40,8 @@ public class JsonUtils {
         objectMapper.setSerializationInclusion(Include.NON_NULL);
         // Do not throw an error when deserializing if there are no corresponding properties
         objectMapper.disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
+        // Serialization supports java.time.LocalDateTime
+        objectMapper.registerModule(new JavaTimeModule());
     }
 
     /**
