@@ -1,7 +1,7 @@
 /*
  * Tencent is pleased to support the open source community by making tRPC available.
  *
- * Copyright (C) 2023 THL A29 Limited, a Tencent company. 
+ * Copyright (C) 2023 THL A29 Limited, a Tencent company.
  * All rights reserved.
  *
  * If you have downloaded a copy of the tRPC source code from Tencent,
@@ -19,11 +19,11 @@ import com.tencent.trpc.core.exception.ErrorCode;
 import com.tencent.trpc.core.exception.TRpcException;
 import com.tencent.trpc.core.logger.Logger;
 import com.tencent.trpc.core.logger.LoggerFactory;
-import com.tencent.trpc.core.rpc.RpcContext;
 import com.tencent.trpc.core.rpc.CallInfo;
 import com.tencent.trpc.core.rpc.ProviderInvoker;
 import com.tencent.trpc.core.rpc.RequestMeta;
 import com.tencent.trpc.core.rpc.Response;
+import com.tencent.trpc.core.rpc.RpcContext;
 import com.tencent.trpc.core.rpc.RpcInvocation;
 import com.tencent.trpc.core.rpc.RpcServerContext;
 import com.tencent.trpc.core.rpc.common.RpcMethodInfo;
@@ -43,8 +43,12 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Enumeration;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
@@ -58,40 +62,108 @@ public abstract class AbstractHttpExecutor {
 
     private static final Logger logger = LoggerFactory.getLogger(AbstractHttpExecutor.class);
 
+    // todo 配置为线程池，需要关闭线程池
+    private final ScheduledExecutorService executor = Executors.newScheduledThreadPool(10);
+
+
     /**
      * Http codec tool
      */
     protected HttpCodec httpCodec;
 
-    protected void execute(HttpServletRequest request, HttpServletResponse response,
+    protected void newExecute(HttpServletRequest request, HttpServletResponse response,
             RpcMethodInfoAndInvoker methodInfoAndInvoker) {
-
         try {
-
             DefRequest rpcRequest = buildDefRequest(request, response, methodInfoAndInvoker);
+            ProviderInvoker<?> invoker = methodInfoAndInvoker.getInvoker();
+            WorkerPool workerPool = invoker.getConfig().getWorkerPoolObj();
 
-            CountDownLatch countDownLatch = new CountDownLatch(1);
-
-            // use a thread pool for asynchronous processing
-            invokeRpcRequest(methodInfoAndInvoker.getInvoker(), rpcRequest, countDownLatch);
-
-            // If the request carries a timeout, use this timeout to wait for the request to be processed.
-            // If not carried, use the default timeout.
-            long requestTimeout = rpcRequest.getMeta().getTimeout();
-            if (requestTimeout <= 0) {
-                requestTimeout = methodInfoAndInvoker.getInvoker().getConfig().getRequestTimeout();
+            if (null == workerPool) {
+                logger.error("dispatch rpcRequest [{}]  error, workerPool is empty", rpcRequest);
+                throw TRpcException.newFrameException(ErrorCode.TRPC_SERVER_NOSERVICE_ERR,
+                        "not found service, workerPool is empty");
             }
-            if (requestTimeout > 0 && !countDownLatch.await(requestTimeout, TimeUnit.MILLISECONDS)) {
-                throw TRpcException.newFrameException(ErrorCode.TRPC_SERVER_TIMEOUT_ERR,
-                        "wait http request execute timeout");
-            } else {
-                countDownLatch.await();
-            }
+            workerPool.execute(() -> {
+                // Invoke the routing implementation method to handle the request.
+                CompletableFuture<Response> future = (CompletableFuture<Response>) invoker.invoke(rpcRequest);
+                // If the request carries a timeout, use this timeout to wait for the request to be processed.
+                // If not carried, use the default timeout.
+                long requestTimeout = rpcRequest.getMeta().getTimeout();
+                if (requestTimeout <= 0) {
+                    requestTimeout = methodInfoAndInvoker.getInvoker().getConfig().getRequestTimeout();
+                }
+                if (requestTimeout > 0) {
+                    ScheduledFuture<?> timeoutFuture = executor.schedule(() -> {
+                        if (!future.isDone()) {
+                            future.completeExceptionally(
+                                    TRpcException.newFrameException(ErrorCode.TRPC_SERVER_TIMEOUT_ERR,
+                                            "wait http request execute timeout"));
+                        }
+                    }, requestTimeout, TimeUnit.SECONDS);
+                }
+                // future.get(requestTimeout, TimeUnit.MICROSECONDS);
+                future.whenComplete((result, t) -> {
+                    try {
+                        // Throw the call exception, which will be handled uniformly by the exception handling program.
+                        if (t != null) {
+                            throw t;
+                        }
+
+                        // Throw a business logic exception, which will be handled uniformly
+                        // by the exception handling program.
+                        Throwable ex = result.getException();
+                        if (ex != null) {
+                            throw ex;
+                        }
+
+                        // normal response
+                        response.setStatus(HttpStatus.SC_OK);
+                        httpCodec.writeHttpResponse(response, result);
+                        response.flushBuffer();
+                    } catch (Throwable e) {
+                        logger.warn("reply message error, channel: [{}], msg:[{}]", request.getRemoteAddr(), request,
+                                e);
+                        httpErrorReply(request, response,
+                                ErrorResponse.create(request, HttpStatus.SC_SERVICE_UNAVAILABLE, e));
+                    }
+                });
+            });
 
         } catch (Exception ex) {
             logger.error("dispatch request [{}] error", request, ex);
             doErrorReply(request, response, ex);
         }
+    }
+
+    protected void execute(HttpServletRequest request, HttpServletResponse response,
+            RpcMethodInfoAndInvoker methodInfoAndInvoker) {
+        newExecute(request, response, methodInfoAndInvoker);
+//        try {
+//
+//            DefRequest rpcRequest = buildDefRequest(request, response, methodInfoAndInvoker);
+//
+//            CountDownLatch countDownLatch = new CountDownLatch(1);
+//
+//            // use a thread pool for asynchronous processing
+//            invokeRpcRequest(methodInfoAndInvoker.getInvoker(), rpcRequest, countDownLatch);
+//
+//            // If the request carries a timeout, use this timeout to wait for the request to be processed.
+//            // If not carried, use the default timeout.
+//            long requestTimeout = rpcRequest.getMeta().getTimeout();
+//            if (requestTimeout <= 0) {
+//                requestTimeout = methodInfoAndInvoker.getInvoker().getConfig().getRequestTimeout();
+//            }
+//            if (requestTimeout > 0 && !countDownLatch.await(requestTimeout, TimeUnit.MILLISECONDS)) {
+//                throw TRpcException.newFrameException(ErrorCode.TRPC_SERVER_TIMEOUT_ERR,
+//                        "wait http request execute timeout");
+//            } else {
+//                countDownLatch.await();
+//            }
+//
+//        } catch (Exception ex) {
+//            logger.error("dispatch request [{}] error", request, ex);
+//            doErrorReply(request, response, ex);
+//        }
 
     }
 
@@ -99,7 +171,7 @@ public abstract class AbstractHttpExecutor {
      * Get the mapped internal method.
      *
      * @param object the key to query the mapped internal method, maby {@link HttpServletRequest} or directly
-     * {@link RpcMethodInfoAndInvoker}.
+     *         {@link RpcMethodInfoAndInvoker}.
      * @return the mapped internal method
      */
     protected abstract RpcMethodInfoAndInvoker getRpcMethodInfoAndInvoker(Object object);
