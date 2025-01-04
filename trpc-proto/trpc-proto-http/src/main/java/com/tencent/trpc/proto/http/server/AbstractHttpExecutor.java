@@ -46,10 +46,9 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import org.apache.commons.lang3.StringUtils;
@@ -61,9 +60,6 @@ import org.apache.http.HttpStatus;
 public abstract class AbstractHttpExecutor {
 
     private static final Logger logger = LoggerFactory.getLogger(AbstractHttpExecutor.class);
-
-    // todo 配置为线程池，需要关闭线程池
-    private final ScheduledExecutorService executor = Executors.newScheduledThreadPool(10);
 
 
     /**
@@ -92,41 +88,28 @@ public abstract class AbstractHttpExecutor {
                 if (requestTimeout <= 0) {
                     requestTimeout = methodInfoAndInvoker.getInvoker().getConfig().getRequestTimeout();
                 }
-                if (requestTimeout > 0) {
-                    ScheduledFuture<?> timeoutFuture = executor.schedule(() -> {
-                        if (!future.isDone()) {
-                            future.completeExceptionally(
-                                    TRpcException.newFrameException(ErrorCode.TRPC_SERVER_TIMEOUT_ERR,
-                                            "wait http request execute timeout"));
-                        }
-                    }, requestTimeout, TimeUnit.SECONDS);
-                }
-                // future.get(requestTimeout, TimeUnit.MICROSECONDS);
-                future.whenComplete((result, t) -> {
-                    try {
-                        // Throw the call exception, which will be handled uniformly by the exception handling program.
-                        if (t != null) {
-                            throw t;
-                        }
-
-                        // Throw a business logic exception, which will be handled uniformly
-                        // by the exception handling program.
-                        Throwable ex = result.getException();
-                        if (ex != null) {
-                            throw ex;
-                        }
-
-                        // normal response
-                        response.setStatus(HttpStatus.SC_OK);
-                        httpCodec.writeHttpResponse(response, result);
-                        response.flushBuffer();
-                    } catch (Throwable e) {
-                        logger.warn("reply message error, channel: [{}], msg:[{}]", request.getRemoteAddr(), request,
-                                e);
-                        httpErrorReply(request, response,
-                                ErrorResponse.create(request, HttpStatus.SC_SERVICE_UNAVAILABLE, e));
+                Response result;
+                try {
+                    if (requestTimeout > 0) {
+                        result = future.get(requestTimeout, TimeUnit.MICROSECONDS);
+                    } else {
+                        result = future.get();
                     }
-                });
+                } catch (InterruptedException | ExecutionException | TimeoutException exception) {
+                    throw TRpcException.newFrameException(ErrorCode.TRPC_SERVER_TIMEOUT_ERR,
+                            "wait http request execute timeout");
+                }
+                // Throw a business logic exception, which will be handled uniformly
+                // by the exception handling program.
+                Throwable ex = result.getException();
+                if (ex != null) {
+                    throw ex;
+                }
+
+                // normal response
+                response.setStatus(HttpStatus.SC_OK);
+                httpCodec.writeHttpResponse(response, result);
+                response.flushBuffer();
             });
 
         } catch (Exception ex) {
