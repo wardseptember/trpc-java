@@ -1,7 +1,7 @@
 /*
  * Tencent is pleased to support the open source community by making tRPC available.
  *
- * Copyright (C) 2023 THL A29 Limited, a Tencent company. 
+ * Copyright (C) 2023 THL A29 Limited, a Tencent company.
  * All rights reserved.
  *
  * If you have downloaded a copy of the tRPC source code from Tencent,
@@ -104,7 +104,7 @@ public class JettyHttpServer extends AbstractHttpServer {
         ServletContextHandler context = getServletContextHandler(server);
 
         int port = config.getPort();
-        ServletManager.getManager().addServletContext(port, context.getServletContext());
+        ServletManager.getManager().addServletContext(port, context.getServletHandler().getServletContext());
         ExecutorDispatcher.addHttpExecutor(port, this.getExecutor());
     }
 
@@ -120,8 +120,9 @@ public class JettyHttpServer extends AbstractHttpServer {
                 servletHandler.addServletWithMapping(ExecutorDispatcher.class, "/*");
         servletHolder.setAsyncSupported(true);
         servletHolder.setInitOrder(1);
-        ServletContextHandler context =
-                new ServletContextHandler(server, "/", ServletContextHandler.SESSIONS);
+        ServletContextHandler context = new ServletContextHandler(ServletContextHandler.SESSIONS);
+        context.setContextPath("/");
+        context.setServer(server);
         context.setServletHandler(servletHandler);
         return context;
     }
