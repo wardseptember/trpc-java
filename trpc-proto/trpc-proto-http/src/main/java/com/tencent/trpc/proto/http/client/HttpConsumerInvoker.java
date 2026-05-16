@@ -63,7 +63,11 @@ public class HttpConsumerInvoker<T> extends AbstractConsumerInvoker<T> {
     public Response send(Request request) throws Exception {
         HttpPost httpPost = buildRequest(request);
 
-        CloseableHttpClient httpClient = ((HttpRpcClient) client).getHttpClient();
+        HttpRpcClient httpRpcClient = (HttpRpcClient) client;
+        // Refresh idle counter so the cluster manager's reconnect-check timer keeps treating
+        // this client as healthy while it's actively serving requests.
+        httpRpcClient.markUsed();
+        CloseableHttpClient httpClient = httpRpcClient.getHttpClient();
 
         try (CloseableHttpResponse httpResponse = httpClient.execute(httpPost)) {
             return handleResponse(request, httpResponse);

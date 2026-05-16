@@ -137,7 +137,11 @@ public class Http2ConsumerInvoker<T> extends AbstractConsumerInvoker<T> {
      */
     private SimpleHttpResponse execute(Request request, int requestTimeout,
             SimpleHttpRequest simpleHttpRequest) throws Exception {
-        CloseableHttpAsyncClient httpAsyncClient = ((Http2cRpcClient) client).getHttpAsyncClient();
+        Http2cRpcClient http2cRpcClient = (Http2cRpcClient) client;
+        // Refresh idle counter so the cluster manager's reconnect-check timer keeps treating
+        // this client as healthy while it's actively serving requests.
+        http2cRpcClient.markUsed();
+        CloseableHttpAsyncClient httpAsyncClient = http2cRpcClient.getHttpAsyncClient();
         Future<SimpleHttpResponse> httpResponseFuture = httpAsyncClient.execute(simpleHttpRequest,
                 new FutureCallback<SimpleHttpResponse>() {
                     @Override
