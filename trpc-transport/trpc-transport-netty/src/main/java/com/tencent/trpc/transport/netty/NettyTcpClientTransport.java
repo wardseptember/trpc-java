@@ -11,8 +11,6 @@
 
 package com.tencent.trpc.transport.netty;
 
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
-
 import com.tencent.trpc.core.common.config.ProtocolConfig;
 import com.tencent.trpc.core.logger.Logger;
 import com.tencent.trpc.core.logger.LoggerFactory;
@@ -25,13 +23,15 @@ import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.concurrent.DefaultThreadFactory;
 
 import java.util.concurrent.CompletableFuture;
 
 /**
- * A netty tcp ClientTransport
+ * A netty tcp ClientTransport.
+ * <p>Long-connection mode: no IdleStateHandler is installed and idle detection is disabled.
+ * Connections are kept alive for the lifetime of the transport and only released when the
+ * transport is shut down or when the peer actively closes the connection.</p>
  */
 public class NettyTcpClientTransport extends NettyAbstractClientTransport {
 
@@ -67,18 +67,17 @@ public class NettyTcpClientTransport extends NettyAbstractClientTransport {
         bootstrap.handler(new ChannelInitializer<NioSocketChannel>() {
             @Override
             protected void initChannel(NioSocketChannel ch) {
-
-                IdleStateHandler clientIdleHandler =
-                        new IdleStateHandler(0, config.getIdleTimeout(), 0, MILLISECONDS);
+                // Long-connection mode: do NOT install IdleStateHandler. The idleTimeout field
+                // is kept for backward compatibility but no longer takes effect on the netty
+                // pipeline.
                 ChannelPipeline p = ch.pipeline();
                 if (codec == null) {
-                    p.addLast("client-idle", clientIdleHandler).addLast("handler", clientHandler);
+                    p.addLast("handler", clientHandler);
                 } else {
                     NettyCodecAdapter nettyCodec = NettyCodecAdapter
                             .createTcpCodecAdapter(codec, config);
                     p.addLast("encode", nettyCodec.getEncoder())
                             .addLast("decode", nettyCodec.getDecoder())
-                            .addLast("client-idle", clientIdleHandler)
                             .addLast("handler", clientHandler);
                 }
             }

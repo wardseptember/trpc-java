@@ -25,8 +25,6 @@ import com.tencent.trpc.core.rpc.Request;
 import com.tencent.trpc.core.rpc.Response;
 import com.tencent.trpc.core.rpc.RpcClient;
 import com.tencent.trpc.core.worker.WorkerPoolManager;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -35,15 +33,40 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Used to manage the list mapping of point-to-point clients generated through BackendConfig,
- * and because the entire framework is based on a pull model to maintain the service IP of the server.
- * Therefore, a scanner is added to remove long-unused clients.
+ * Used to manage the list mapping of point-to-point clients generated through BackendConfig.
+ * <p>
+ * Long-connection mode (Dubbo-style reconnect timer):
+ * <ul>
+ *     <li>Clients are kept alive for the lifetime of the {@link BackendConfig}; no idle timeout
+ *         scanner closes idle connections.</li>
+ *     <li>A lightweight background timer periodically (every
+ *         {@value #RECONNECT_CHECK_PERIOD_SECONDS}s) scans cached clients. If a client is found
+ *         to be unavailable, its failure counter is incremented; once the counter reaches
+ *         {@value #MAX_RECONNECT_FAILURES}, the client is closed and evicted, freeing memory and
+ *         allowing the next request to rebuild a fresh long connection.</li>
+ *     <li>When the underlying {@link RpcClient} closes itself (transport error or our own timer),
+ *         the {@link RpcClient#closeFuture()} callback removes the cache entry.</li>
+ *     <li>{@link #shutdownBackendConfig(BackendConfig)} / {@link #close()} still release clients
+ *         explicitly.</li>
+ * </ul>
  */
 public class RpcClusterClientManager {
 
     private static final Logger logger = LoggerFactory.getLogger(RpcClusterClientManager.class);
+
+    /**
+     * Period of the reconnect-check timer in seconds.
+     */
+    private static final int RECONNECT_CHECK_PERIOD_SECONDS = 30;
+    /**
+     * Maximum number of consecutive reconnect-check failures tolerated before the client is
+     * closed and evicted from the cache.
+     */
+    private static final int MAX_RECONNECT_FAILURES = 5;
+
     /**
      * Cluster map, {@code Map<BackendConfig, Map<String, RpcClientProxy>>}
      */
@@ -52,14 +75,11 @@ public class RpcClusterClientManager {
      * Is close flag
      */
     private static final AtomicBoolean CLOSED_FLAG = new AtomicBoolean(false);
-    /**
-     * Prevent too many clients and perform periodic cleaning.
-     */
-    private static ScheduledFuture<?> cleanerFuture;
 
-    static {
-        cleanerFuture = startRpcClientCleaner();
-    }
+    /**
+     * Reconnect-check timer handle. Started lazily on first {@link #getOrCreateClient}.
+     */
+    private static volatile ScheduledFuture<?> reconnectCheckerFuture;
 
     /**
      * Shutdown a cluster.
@@ -83,68 +103,10 @@ public class RpcClusterClientManager {
     }
 
     /**
-     * Used to periodically scan unused clients and release them.
-     * <p>Add judgment to determine whether to close the shared thread pool.</p>
-     *
-     * @return ScheduledFuture, a delayed result-bearing action that can be cancelled
-     */
-    private static ScheduledFuture<?> startRpcClientCleaner() {
-        return Optional.ofNullable(WorkerPoolManager.getShareScheduler())
-                .map(ss -> {
-                    if (ss.isShutdown()) {
-                        return null;
-                    }
-                    return ss.scheduleAtFixedRate(() -> {
-                        try {
-                            scanUnusedClient();
-                        } catch (Throwable ex) {
-                            logger.error("RpcClientCleaner exception", ex);
-                        }
-                    }, 0, 15, TimeUnit.MINUTES);
-                }).orElse(null);
-    }
-
-    /**
-     * Scanning for unused clients.
-     */
-    public static void scanUnusedClient() {
-        Map<BackendConfig, List<RpcClient>> unusedClientMap = Maps.newHashMap();
-        CLUSTER_MAP.forEach((bConfig, clusterMap) -> {
-            if (logger.isDebugEnabled()) {
-                logger.debug("RpcClusterClient scheduler report clusterName={}, naming={}, num of client is {}",
-                        bConfig.getName(), bConfig.getNamingOptions().getServiceNaming(), clusterMap.keySet().size());
-            }
-            clusterMap.forEach((clientKey, clientValue) -> {
-                try {
-                    if (isIdleTimeout(bConfig, clientValue)) {
-                        Optional.ofNullable(clusterMap.remove(clientKey))
-                                .ifPresent(rpcCli -> unusedClientMap.computeIfAbsent(bConfig, k -> new ArrayList<>())
-                                        .add(rpcCli));
-                    }
-                } catch (Throwable ex) {
-                    logger.error("RpcClientCleaner exception", ex);
-                }
-            });
-        });
-        unusedClientMap.forEach((bConfig, value) -> value.forEach(e -> {
-            try {
-                e.close();
-            } finally {
-                logger.warn("RpcClient in clusterName={}, naming={}, remove rpc client{}, due to unused time > {} ms",
-                        bConfig.getName(), bConfig.getNamingOptions().getServiceNaming(),
-                        e.getProtocolConfig().toSimpleString(), bConfig.getIdleTimeout());
-            }
-        }));
-    }
-
-    private static boolean isIdleTimeout(BackendConfig bConfig, RpcClientProxy clientProxy) {
-        long unusedNanosLimit = TimeUnit.MILLISECONDS.toNanos(bConfig.getIdleTimeout());
-        long lastUsedNanos = clientProxy.getLastUsedNanos();
-        return lastUsedNanos > 0 && unusedNanosLimit > 0 && (System.nanoTime() - lastUsedNanos) > unusedNanosLimit;
-    }
-
-    /**
      * Get RpcClient based on BackendConfig. If RpcClient does not exist, create a new one and cache it.
+     * <p>The created client is a long-lived connection. To prevent memory leak, when the
+     * underlying client is closed (by itself or by the reconnect-check timer below), its entry
+     * in the cache is removed via the {@link RpcClient#closeFuture()} callback.</p>
      *
      * @param bConfig BackendConfig, configuration for the backend
      * @param pConfig ProtocolConfig, configuration for the protocol
@@ -152,10 +114,28 @@ public class RpcClusterClientManager {
      */
     public static RpcClient getOrCreateClient(BackendConfig bConfig, ProtocolConfig pConfig) {
         Preconditions.checkNotNull(bConfig, "backendConfig can't not be null");
+        ensureReconnectCheckerStarted();
         Map<String, RpcClientProxy> map = CLUSTER_MAP.computeIfAbsent(bConfig, k -> new ConcurrentHashMap<>());
-        RpcClientProxy rpcClientProxy = map.computeIfAbsent(pConfig.toUniqId(),
-                uniqId -> createRpcClientProxy(pConfig));
-        rpcClientProxy.updateLastUsedNanos();
+        String uniqId = pConfig.toUniqId();
+        RpcClientProxy rpcClientProxy = map.computeIfAbsent(uniqId,
+                k -> {
+                    RpcClientProxy proxy = createRpcClientProxy(pConfig);
+                    // When the underlying rpcClient closes (transport error or reconnect-check
+                    // eviction), remove it from the cache to avoid memory leak. The next call
+                    // will rebuild a new long connection on demand.
+                    proxy.closeFuture().whenComplete((r, e) -> {
+                        Map<String, RpcClientProxy> clusterMap = CLUSTER_MAP.get(bConfig);
+                        if (clusterMap != null) {
+                            // Only remove if the cached proxy is still the same instance.
+                            clusterMap.remove(k, proxy);
+                        }
+                        if (logger.isDebugEnabled()) {
+                            logger.debug("RpcClient closed, removed from cluster cache, backendConfig={}, client={}",
+                                    bConfig.toSimpleString(), proxy.getProtocolConfig().toSimpleString());
+                        }
+                    });
+                    return proxy;
+                });
         return rpcClientProxy;
     }
 
@@ -175,14 +155,84 @@ public class RpcClusterClientManager {
     }
 
     /**
+     * Lazily start the reconnect-check timer on first usage. Idempotent and thread-safe.
+     */
+    private static void ensureReconnectCheckerStarted() {
+        if (reconnectCheckerFuture != null || CLOSED_FLAG.get()) {
+            return;
+        }
+        synchronized (RpcClusterClientManager.class) {
+            if (reconnectCheckerFuture != null || CLOSED_FLAG.get()) {
+                return;
+            }
+            try {
+                reconnectCheckerFuture = WorkerPoolManager.getShareScheduler().scheduleAtFixedRate(
+                        RpcClusterClientManager::checkAndReconnect,
+                        RECONNECT_CHECK_PERIOD_SECONDS,
+                        RECONNECT_CHECK_PERIOD_SECONDS,
+                        TimeUnit.SECONDS);
+            } catch (Throwable ex) {
+                logger.warn("Start reconnect-check timer failed, will fall back to lazy reconnect "
+                        + "on request path only", ex);
+            }
+        }
+    }
+
+    /**
+     * Periodic check (Dubbo-style ReconnectTimerTask): walk every cached client; for each one
+     * that is currently unavailable, increment its failure counter; once the counter reaches
+     * {@link #MAX_RECONNECT_FAILURES} the client is closed (which triggers
+     * {@code closeFuture} → cache eviction). Healthy clients have their counter reset.
+     * <p>The check itself does not actively send a heartbeat: it simply observes the current
+     * connection state. The transport's existing lazy reconnect (triggered by request path or
+     * by Netty's channelInactive event) takes care of re-establishing the long connection.</p>
+     */
+    static void checkAndReconnect() {
+        if (CLOSED_FLAG.get()) {
+            return;
+        }
+        CLUSTER_MAP.forEach((bConfig, clusterMap) -> clusterMap.forEach((key, proxy) -> {
+            try {
+                if (proxy.isAvailable()) {
+                    proxy.failureCount.set(0);
+                    return;
+                }
+                int fails = proxy.failureCount.incrementAndGet();
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Reconnect-check: client {} not available, failureCount={}",
+                            proxy.getProtocolConfig().toSimpleString(), fails);
+                }
+                if (fails >= MAX_RECONNECT_FAILURES) {
+                    logger.warn("Reconnect-check: client {} unavailable for {} consecutive checks "
+                                    + "(~{}s), closing and evicting from cache",
+                            proxy.getProtocolConfig().toSimpleString(), fails,
+                            fails * RECONNECT_CHECK_PERIOD_SECONDS);
+                    try {
+                        proxy.close();
+                    } catch (Throwable ex) {
+                        logger.error("Close stale client {} failed",
+                                proxy.getProtocolConfig().toSimpleString(), ex);
+                    }
+                }
+            } catch (Throwable ex) {
+                logger.error("Reconnect-check on client {} threw", key, ex);
+            }
+        }));
+    }
+
+    /**
      * Close client
      */
     public static void close() {
         if (CLOSED_FLAG.compareAndSet(Boolean.FALSE, Boolean.TRUE)) {
             try {
-                Optional.ofNullable(cleanerFuture).ifPresent(cf -> cf.cancel(Boolean.TRUE));
+                ScheduledFuture<?> f = reconnectCheckerFuture;
+                if (f != null) {
+                    f.cancel(true);
+                    reconnectCheckerFuture = null;
+                }
             } catch (Exception ex) {
-                logger.error("clientCleanerFuture ", ex);
+                logger.error("Cancel reconnect-check timer failed", ex);
             }
             CLUSTER_MAP.forEach((config, clientProxyMap) -> clientProxyMap
                     .forEach((key, clientProxy) -> {
@@ -193,6 +243,7 @@ public class RpcClusterClientManager {
                                     ex);
                         }
                     }));
+            CLUSTER_MAP.clear();
         }
     }
 
@@ -218,7 +269,6 @@ public class RpcClusterClientManager {
 
         @Override
         public CompletionStage<Response> invoke(Request request) {
-            rpcClient.updateLastUsedNanos();
             return delegate.invoke(request);
         }
 
@@ -255,20 +305,15 @@ public class RpcClusterClientManager {
 
     private static class RpcClientProxy implements RpcClient {
 
-        private RpcClient delegate;
-
-        private volatile long lastUsedNanos = System.nanoTime();
+        private final RpcClient delegate;
+        /**
+         * Consecutive failure count observed by the reconnect-check timer; reset to 0 whenever
+         * the client is observed available.
+         */
+        final AtomicInteger failureCount = new AtomicInteger(0);
 
         RpcClientProxy(RpcClient delegate) {
             this.delegate = delegate;
-        }
-
-        public void updateLastUsedNanos() {
-            lastUsedNanos = System.nanoTime();
-        }
-
-        public long getLastUsedNanos() {
-            return lastUsedNanos;
         }
 
         @Override

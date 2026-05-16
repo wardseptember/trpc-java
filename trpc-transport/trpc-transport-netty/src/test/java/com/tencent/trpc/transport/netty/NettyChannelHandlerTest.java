@@ -33,7 +33,8 @@ public class NettyChannelHandlerTest {
         new NettyClientHandler(new ChannelHandlerAdapter(), new ProtocolConfig(), true)
                 .userEventTriggered(new ChannelHandlerContextTest(channelTest2),
                         IdleStateEvent.WRITER_IDLE_STATE_EVENT);
-        Assert.assertTrue(channelTest2.getIsClose() != null && channelTest2.isClose);
+        // Long-connection mode: client must NOT close the channel on idle event.
+        Assert.assertTrue(channelTest2.getIsClose() == null || !channelTest2.isClose);
 
         ChannelTest channelTest3 = new ChannelTest();
         channelTest3.setActive(true);
@@ -47,6 +48,7 @@ public class NettyChannelHandlerTest {
         new NettyServerHandler(new ChannelHandlerAdapter(), new ProtocolConfig(), true)
                 .userEventTriggered(new ChannelHandlerContextTest(channelTest4),
                         IdleStateEvent.WRITER_IDLE_STATE_EVENT);
-        Assert.assertTrue(channelTest4.getIsClose() != null && channelTest4.isClose);
+        // Long-connection mode: server must NOT close the channel on idle event.
+        Assert.assertTrue(channelTest4.getIsClose() == null || !channelTest4.isClose);
     }
 }

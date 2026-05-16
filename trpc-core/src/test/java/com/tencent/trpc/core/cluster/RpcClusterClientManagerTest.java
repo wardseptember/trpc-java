@@ -40,9 +40,12 @@ public class RpcClusterClientManagerTest {
         field.setAccessible(true);
         Map<BackendConfig, Map> clusterMap = (Map<BackendConfig, Map>) field.get(null);
         assertEquals(1, clusterMap.get(backendConfig).size());
+        // Long-connection mode: idle scanning is disabled, the client should still be cached after sleep.
         Thread.sleep(10);
-        RpcClusterClientManager.scanUnusedClient();
-        assertEquals(0, clusterMap.get(backendConfig).size());
+        assertEquals(1, clusterMap.get(backendConfig).size());
+        // Explicit shutdown should release the cached client.
+        RpcClusterClientManager.shutdownBackendConfig(backendConfig);
+        Assert.assertNull(clusterMap.get(backendConfig));
         BackendConfig backend = new BackendConfig();
         backend.setNamingUrl("ip://127.0.0.1:8081");
         RpcClusterClientManager.getOrCreateClient(backend, config);
@@ -57,7 +60,6 @@ public class RpcClusterClientManagerTest {
         ProtocolConfigTest config = new ProtocolConfigTest();
         RpcClient rpcClient = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
         Assert.assertNotNull(rpcClient);
-        RpcClusterClientManager.scanUnusedClient();
         RpcClusterClientManager.shutdownBackendConfig(backendConfig);
     }
 
@@ -95,7 +97,11 @@ public class RpcClusterClientManagerTest {
 
     @Test
     public void testScanWithEmptyCluster() {
-        RpcClusterClientManager.scanUnusedClient();
+        // Long-connection mode: no idle scanning. This test just ensures that querying / shutting
+        // down a non-existent backend works on an empty cluster.
+        BackendConfig backendConfig = new BackendConfig();
+        backendConfig.setNamingUrl("ip://127.0.0.1:9998");
+        RpcClusterClientManager.shutdownBackendConfig(backendConfig);
     }
 
     private static class ProtocolConfigTest extends ProtocolConfig {

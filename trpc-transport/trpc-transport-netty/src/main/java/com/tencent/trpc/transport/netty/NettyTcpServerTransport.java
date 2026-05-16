@@ -11,8 +11,6 @@
 
 package com.tencent.trpc.transport.netty;
 
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
-
 import com.tencent.trpc.core.common.config.ProtocolConfig;
 import com.tencent.trpc.core.exception.TransportException;
 import com.tencent.trpc.core.logger.Logger;
@@ -40,7 +38,6 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.flush.FlushConsolidationHandler;
-import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.Version;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import java.util.HashSet;
@@ -122,16 +119,14 @@ public class NettyTcpServerTransport extends AbstractServerTransport {
             @Override
             protected void initChannel(SocketChannel ch) throws Exception {
                 ChannelPipeline p = ch.pipeline();
-                IdleStateHandler idleHandler =
-                        new IdleStateHandler(0, 0, config.getIdleTimeout(), MILLISECONDS);
-                if (codec == null) {
-                    p.addLast("server-idle", idleHandler);
-                } else {
+                // Long-connection mode: do NOT install IdleStateHandler. The idleTimeout field
+                // is kept for backward compatibility but no longer takes effect on the netty
+                // pipeline. The server never proactively closes a client connection due to idle.
+                if (codec != null) {
                     NettyCodecAdapter nettyCodec = NettyCodecAdapter
                             .createTcpCodecAdapter(codec, config);
                     p.addLast("encode", nettyCodec.getEncoder())//
-                            .addLast("decode", nettyCodec.getDecoder())//
-                            .addLast("server-idle", idleHandler);
+                            .addLast("decode", nettyCodec.getDecoder());
                 }
                 if (flushConsolidationSwitch) {
                     p.addLast("flushConsolidationHandlers",

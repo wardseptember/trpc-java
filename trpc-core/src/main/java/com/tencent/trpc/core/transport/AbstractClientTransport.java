@@ -11,7 +11,6 @@
 
 package com.tencent.trpc.core.transport;
 
-import com.google.common.collect.Lists;
 import com.tencent.trpc.core.common.LifecycleBase;
 import com.tencent.trpc.core.common.config.ProtocolConfig;
 import com.tencent.trpc.core.exception.LifecycleException;
@@ -24,6 +23,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -64,7 +64,11 @@ public abstract class AbstractClientTransport implements ClientTransport {
      */
     protected AtomicInteger channelIdx = new AtomicInteger(0);
     /**
-     * List of channels.
+     * Channel pool. Backed by {@link CopyOnWriteArrayList} so that the slot publication done by
+     * {@link #ensureChannelActive} (under {@link #connLock}) is visible to concurrent readers in
+     * {@link #getChannel0} with volatile semantics, eliminating the data race that an
+     * {@link java.util.ArrayList} would have. Size is bounded by {@code connsPerAddr}; writes
+     * are infrequent (slot rebuild on disconnect) so the COW copy cost is negligible.
      */
     protected List<ChannelFutureItem> channels;
     /**
@@ -80,7 +84,7 @@ public abstract class AbstractClientTransport implements ClientTransport {
         this.config = Objects.requireNonNull(config, "config is null");
         this.handler = Objects.requireNonNull(handler, "handler is null");
         this.codec = clientCodec;
-        this.channels = Lists.newArrayListWithExpectedSize(config.getConnsPerAddr());
+        this.channels = new CopyOnWriteArrayList<>();
     }
 
     /**
