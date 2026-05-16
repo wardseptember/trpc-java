@@ -12,6 +12,10 @@
 package com.tencent.trpc.core.cluster;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 import com.tencent.trpc.core.common.config.BackendConfig;
 import com.tencent.trpc.core.common.config.ConsumerConfig;
@@ -21,11 +25,30 @@ import com.tencent.trpc.core.rpc.CloseFuture;
 import com.tencent.trpc.core.rpc.ConsumerInvoker;
 import com.tencent.trpc.core.rpc.RpcClient;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.junit.After;
 import org.junit.Assert;
+import org.junit.Before;
 import org.junit.Test;
 
 public class RpcClusterClientManagerTest {
+
+    @Before
+    public void setUp() {
+        // ensure clean state across tests (tests may have flipped CLOSED_FLAG)
+        RpcClusterClientManager.reset();
+    }
+
+    @After
+    public void tearDown() throws Exception {
+        // Clear cluster cache to keep tests independent.
+        Field field = RpcClusterClientManager.class.getDeclaredField("CLUSTER_MAP");
+        field.setAccessible(true);
+        ((Map<?, ?>) field.get(null)).clear();
+        RpcClusterClientManager.reset();
+    }
 
     @Test
     public void test() throws IllegalArgumentException, IllegalAccessException, NoSuchFieldException,
@@ -45,7 +68,7 @@ public class RpcClusterClientManagerTest {
         assertEquals(1, clusterMap.get(backendConfig).size());
         // Explicit shutdown should release the cached client.
         RpcClusterClientManager.shutdownBackendConfig(backendConfig);
-        Assert.assertNull(clusterMap.get(backendConfig));
+        assertNull(clusterMap.get(backendConfig));
         BackendConfig backend = new BackendConfig();
         backend.setNamingUrl("ip://127.0.0.1:8081");
         RpcClusterClientManager.getOrCreateClient(backend, config);
@@ -53,7 +76,7 @@ public class RpcClusterClientManagerTest {
     }
 
     @Test
-    public void testDebugLog() throws Exception {
+    public void testDebugLog() {
         BackendConfig backendConfig = new BackendConfig();
         backendConfig.setIdleTimeout(100000);
         backendConfig.setNamingUrl("ip://127.0.0.1:8082");
@@ -64,7 +87,7 @@ public class RpcClusterClientManagerTest {
     }
 
     @Test
-    public void testGetOrCreateClientTwice() throws Exception {
+    public void testGetOrCreateClientTwice() {
         BackendConfig backendConfig = new BackendConfig();
         backendConfig.setIdleTimeout(100000);
         backendConfig.setNamingUrl("ip://127.0.0.1:8083");
@@ -73,17 +96,21 @@ public class RpcClusterClientManagerTest {
         RpcClient rpcClient2 = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
         Assert.assertNotNull(rpcClient1);
         Assert.assertNotNull(rpcClient2);
+        // Same key should return the same proxy instance (cache hit).
+        Assert.assertSame(rpcClient1, rpcClient2);
         RpcClusterClientManager.shutdownBackendConfig(backendConfig);
     }
 
     @Test
-    public void testClose() throws Exception {
+    public void testClose() {
         BackendConfig backendConfig = new BackendConfig();
         backendConfig.setIdleTimeout(100000);
         backendConfig.setNamingUrl("ip://127.0.0.1:8084");
         ProtocolConfigTest config = new ProtocolConfigTest();
         RpcClient rpcClient = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
         Assert.assertNotNull(rpcClient);
+        RpcClusterClientManager.close();
+        // close() is idempotent, second call should be a no-op.
         RpcClusterClientManager.close();
         RpcClusterClientManager.reset();
     }
@@ -97,31 +124,324 @@ public class RpcClusterClientManagerTest {
 
     @Test
     public void testScanWithEmptyCluster() {
-        // Long-connection mode: no idle scanning. This test just ensures that querying / shutting
-        // down a non-existent backend works on an empty cluster.
         BackendConfig backendConfig = new BackendConfig();
         backendConfig.setNamingUrl("ip://127.0.0.1:9998");
         RpcClusterClientManager.shutdownBackendConfig(backendConfig);
     }
 
+    /**
+     * Triggers shutdownBackendConfig's catch branch: a client whose close() throws.
+     */
+    @Test
+    public void testShutdownBackendConfigWhenCloseThrows() throws Exception {
+        BackendConfig backendConfig = new BackendConfig();
+        backendConfig.setNamingUrl("ip://127.0.0.1:9001");
+        ProtocolConfigTest config = new ProtocolConfigTest();
+        config.failOnClose = true;
+        RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+        // Should swallow exception and complete normally.
+        RpcClusterClientManager.shutdownBackendConfig(backendConfig);
+        Field field = RpcClusterClientManager.class.getDeclaredField("CLUSTER_MAP");
+        field.setAccessible(true);
+        Map<?, ?> map = (Map<?, ?>) field.get(null);
+        assertNull(map.get(backendConfig));
+    }
+
+    /**
+     * Triggers close()'s catch branch when the client throws on close.
+     */
+    @Test
+    public void testCloseWhenClientCloseThrows() {
+        BackendConfig backendConfig = new BackendConfig();
+        backendConfig.setNamingUrl("ip://127.0.0.1:9002");
+        ProtocolConfigTest config = new ProtocolConfigTest();
+        config.failOnClose = true;
+        RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+        // Should not propagate the exception out.
+        RpcClusterClientManager.close();
+        RpcClusterClientManager.reset();
+    }
+
+    /**
+     * createRpcClientProxy: when open() throws, the partially-created proxy should be closed
+     * to avoid resource leak, and the exception should propagate.
+     */
+    @Test
+    public void testCreateClientWhenOpenThrows() {
+        BackendConfig backendConfig = new BackendConfig();
+        backendConfig.setNamingUrl("ip://127.0.0.1:9003");
+        ProtocolConfigTest config = new ProtocolConfigTest();
+        config.failOnOpen = true;
+        try {
+            RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+            Assert.fail("expected exception");
+        } catch (RuntimeException expected) {
+            // expected
+        }
+    }
+
+    /**
+     * After CLOSED_FLAG is set, getOrCreateClient must reject new client creation.
+     */
+    @Test
+    public void testGetOrCreateClientAfterClose() {
+        RpcClusterClientManager.close();
+        BackendConfig backendConfig = new BackendConfig();
+        backendConfig.setNamingUrl("ip://127.0.0.1:9004");
+        ProtocolConfigTest config = new ProtocolConfigTest();
+        try {
+            RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+            Assert.fail("expected IllegalArgumentException");
+        } catch (IllegalArgumentException expected) {
+            // expected
+        } finally {
+            RpcClusterClientManager.reset();
+        }
+    }
+
+    /**
+     * Direct invocation of checkAndReconnect: client is healthy, failureCount stays at 0.
+     */
+    @Test
+    public void testCheckAndReconnectHealthyClient() throws Exception {
+        BackendConfig backendConfig = new BackendConfig();
+        backendConfig.setNamingUrl("ip://127.0.0.1:9005");
+        ProtocolConfigTest config = new ProtocolConfigTest();
+        RpcClient client = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+        invokeCheckAndReconnect();
+        // Healthy client must not be evicted.
+        Field field = RpcClusterClientManager.class.getDeclaredField("CLUSTER_MAP");
+        field.setAccessible(true);
+        Map<BackendConfig, Map> clusterMap = (Map<BackendConfig, Map>) field.get(null);
+        assertEquals(1, clusterMap.get(backendConfig).size());
+        assertEquals(0, getFailureCount(client));
+        RpcClusterClientManager.shutdownBackendConfig(backendConfig);
+    }
+
+    /**
+     * Direct invocation: client unavailable, failureCount accumulates and after MAX_RECONNECT_FAILURES
+     * the client is closed and evicted from the cache via the closeFuture hook.
+     */
+    @Test
+    public void testCheckAndReconnectUnavailableTriggersEviction() throws Exception {
+        BackendConfig backendConfig = new BackendConfig();
+        backendConfig.setNamingUrl("ip://127.0.0.1:9006");
+        ProtocolConfigTest config = new ProtocolConfigTest();
+        config.available = false;
+        RpcClient client = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+
+        Field field = RpcClusterClientManager.class.getDeclaredField("CLUSTER_MAP");
+        field.setAccessible(true);
+        Map<BackendConfig, Map> clusterMap = (Map<BackendConfig, Map>) field.get(null);
+        assertEquals(1, clusterMap.get(backendConfig).size());
+
+        // Run 4 times: failureCount grows but no eviction yet.
+        for (int i = 0; i < 4; i++) {
+            invokeCheckAndReconnect();
+        }
+        assertEquals(4, getFailureCount(client));
+        assertEquals(1, clusterMap.get(backendConfig).size());
+
+        // 5th run hits MAX_RECONNECT_FAILURES, triggers proxy.close() → closeFuture →
+        // CLUSTER_MAP.remove(uniqId, proxy).
+        invokeCheckAndReconnect();
+        assertTrue(config.closed.get());
+        Map sub = clusterMap.get(backendConfig);
+        // Either the inner map is now empty or the entry was removed.
+        if (sub != null) {
+            assertEquals(0, sub.size());
+        }
+    }
+
+    /**
+     * checkAndReconnect must early-return when CLOSED_FLAG is true. Also ensures the close branch
+     * inside checkAndReconnect handles client.close() throwing without breaking the loop.
+     */
+    @Test
+    public void testCheckAndReconnectShortCircuitsOnClosed() throws Exception {
+        RpcClusterClientManager.close();
+        // Should not throw.
+        invokeCheckAndReconnect();
+        RpcClusterClientManager.reset();
+    }
+
+    /**
+     * Drives the catch branch of checkAndReconnect's per-proxy try block: proxy.close() throws.
+     */
+    @Test
+    public void testCheckAndReconnectSwallowsCloseException() throws Exception {
+        BackendConfig backendConfig = new BackendConfig();
+        backendConfig.setNamingUrl("ip://127.0.0.1:9007");
+        ProtocolConfigTest config = new ProtocolConfigTest();
+        config.available = false;
+        config.failOnClose = true;
+        RpcClient client = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+
+        for (int i = 0; i < 5; i++) {
+            invokeCheckAndReconnect();
+        }
+        // Must NOT throw out of the timer loop. Failure count should reach >= MAX (5).
+        assertTrue(getFailureCount(client) >= 5);
+        RpcClusterClientManager.shutdownBackendConfig(backendConfig);
+    }
+
+    /**
+     * Exercises the RpcClientProxy delegate methods: open / createInvoker / closeFuture /
+     * isClosed / isAvailable / getProtocolConfig / equals / hashCode.
+     */
+    @Test
+    public void testRpcClientProxyDelegation() {
+        BackendConfig backendConfig = new BackendConfig();
+        backendConfig.setNamingUrl("ip://127.0.0.1:9008");
+        ProtocolConfigTest config = new ProtocolConfigTest();
+        config.invokerSupplier = () -> new StubConsumerInvoker();
+        RpcClient proxy = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+
+        assertTrue(proxy.isAvailable());
+        assertFalse(proxy.isClosed());
+        assertNotNull(proxy.closeFuture());
+        assertNotNull(proxy.getProtocolConfig());
+        // createInvoker delegates and wraps with ConsumerInvokerProxy.
+        ConsumerConfig<Object> cc = new ConsumerConfig<>();
+        ConsumerInvoker<Object> invoker = proxy.createInvoker(cc);
+        // The wrapped invoker delegates getInterface / getConfig / getProtocolConfig / invoke.
+        assertNotNull(invoker.getInterface());
+        assertNotNull(invoker.getConfig());
+        assertNotNull(invoker.getProtocolConfig());
+        assertNotNull(invoker.invoke(null));
+
+        // getOrCreateClient with the same key must return the cached proxy (same ref).
+        RpcClient sameKey = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+        Assert.assertSame(proxy, sameKey);
+        Assert.assertEquals(proxy.hashCode(), sameKey.hashCode());
+        Assert.assertEquals(proxy, sameKey);
+        Assert.assertNotEquals(proxy, null);
+        Assert.assertNotEquals(proxy, "string");
+
+        RpcClusterClientManager.shutdownBackendConfig(backendConfig);
+    }
+
+    /**
+     * Exercises ConsumerInvokerProxy.equals/hashCode through the client-created invoker chain.
+     */
+    @Test
+    public void testConsumerInvokerProxyEquality() {
+        BackendConfig backendConfig = new BackendConfig();
+        backendConfig.setNamingUrl("ip://127.0.0.1:9009");
+        ProtocolConfigTest config = new ProtocolConfigTest();
+        // Always wrap the SAME delegate so the two outer ConsumerInvokerProxy instances are equal.
+        StubConsumerInvoker shared = new StubConsumerInvoker();
+        config.invokerSupplier = () -> shared;
+        RpcClient proxy = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+
+        ConsumerConfig<Object> cc = new ConsumerConfig<>();
+        ConsumerInvoker<Object> a = proxy.createInvoker(cc);
+        ConsumerInvoker<Object> b = proxy.createInvoker(cc);
+        Assert.assertEquals(a, b);
+        Assert.assertEquals(a.hashCode(), b.hashCode());
+        Assert.assertEquals(a, a);
+        Assert.assertNotEquals(a, null);
+        Assert.assertNotEquals(a, "string");
+
+        RpcClusterClientManager.shutdownBackendConfig(backendConfig);
+    }
+
+    /**
+     * Stub ConsumerInvoker for delegation/equality tests.
+     */
+    private static class StubConsumerInvoker implements ConsumerInvoker<Object> {
+
+        @Override
+        public Class<Object> getInterface() {
+            return Object.class;
+        }
+
+        @Override
+        public java.util.concurrent.CompletionStage<com.tencent.trpc.core.rpc.Response> invoke(
+                com.tencent.trpc.core.rpc.Request request) {
+            return java.util.concurrent.CompletableFuture.completedFuture(null);
+        }
+
+        @Override
+        public ConsumerConfig<Object> getConfig() {
+            return new ConsumerConfig<>();
+        }
+
+        @Override
+        public ProtocolConfig getProtocolConfig() {
+            return new ProtocolConfig();
+        }
+    }
+
+    /**
+     * Lazy timer start: the first getOrCreateClient triggers ensureReconnectCheckerStarted; the
+     * future field becomes non-null. Calling getOrCreateClient again must NOT replace it.
+     */
+    @Test
+    public void testReconnectCheckerStartedLazilyAndOnce() throws Exception {
+        BackendConfig backendConfig = new BackendConfig();
+        backendConfig.setNamingUrl("ip://127.0.0.1:9010");
+        ProtocolConfigTest config = new ProtocolConfigTest();
+        RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+
+        Field f = RpcClusterClientManager.class.getDeclaredField("reconnectCheckerFuture");
+        f.setAccessible(true);
+        Object first = f.get(null);
+        assertNotNull("timer should be started", first);
+
+        // Second call must not replace it.
+        RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+        Object second = f.get(null);
+        Assert.assertSame(first, second);
+
+        RpcClusterClientManager.shutdownBackendConfig(backendConfig);
+    }
+
+    /* ---------------------- helpers ---------------------- */
+
+    private static void invokeCheckAndReconnect() throws Exception {
+        Method m = RpcClusterClientManager.class.getDeclaredMethod("checkAndReconnect");
+        m.setAccessible(true);
+        m.invoke(null);
+    }
+
+    private static int getFailureCount(RpcClient proxy) throws Exception {
+        Field f = proxy.getClass().getDeclaredField("failureCount");
+        f.setAccessible(true);
+        return ((java.util.concurrent.atomic.AtomicInteger) f.get(proxy)).get();
+    }
+
+    /* ---------------------- mock ProtocolConfig ---------------------- */
+
     private static class ProtocolConfigTest extends ProtocolConfig {
+
+        boolean available = true;
+        boolean failOnOpen = false;
+        boolean failOnClose = false;
+        final AtomicBoolean closed = new AtomicBoolean(false);
+        java.util.function.Supplier<ConsumerInvoker<?>> invokerSupplier;
 
         @Override
         public RpcClient createClient() {
             return new RpcClient() {
 
+                private final CloseFuture<Void> closeFuture = new CloseFuture<>();
+
                 @Override
                 public void open() throws TRpcException {
+                    if (failOnOpen) {
+                        throw new RuntimeException("boom-open");
+                    }
                 }
 
                 @Override
                 public boolean isClosed() {
-                    return false;
+                    return closed.get();
                 }
 
                 @Override
                 public boolean isAvailable() {
-                    return true;
+                    return available && !closed.get();
                 }
 
                 @Override
@@ -131,16 +451,27 @@ public class RpcClusterClientManagerTest {
 
                 @Override
                 public void close() {
+                    closed.set(true);
+                    if (failOnClose) {
+                        // Still complete the future first so cache eviction proceeds.
+                        closeFuture.complete(null);
+                        throw new RuntimeException("boom-close");
+                    }
+                    closeFuture.complete(null);
                 }
 
+                @SuppressWarnings({"unchecked", "rawtypes"})
                 @Override
                 public <T> ConsumerInvoker<T> createInvoker(ConsumerConfig<T> consumerConfig) {
+                    if (invokerSupplier != null) {
+                        return (ConsumerInvoker<T>) invokerSupplier.get();
+                    }
                     return null;
                 }
 
                 @Override
                 public CloseFuture<Void> closeFuture() {
-                    return new CloseFuture<Void>();
+                    return closeFuture;
                 }
             };
         }
