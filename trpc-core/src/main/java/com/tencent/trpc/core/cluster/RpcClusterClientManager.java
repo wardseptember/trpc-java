@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Used to manage the list mapping of point-to-point clients generated through BackendConfig.
  * <p>
- * Long-connection mode (Dubbo-style reconnect timer):
+ * Long-connection mode:
  * <ul>
  *     <li>Clients are kept alive for the lifetime of the {@link BackendConfig}; no idle timeout
  *         scanner closes idle connections.</li>
@@ -179,7 +179,7 @@ public class RpcClusterClientManager {
     }
 
     /**
-     * Periodic check (Dubbo-style ReconnectTimerTask): walk every cached client; for each one
+     * Periodic check: walk every cached client; for each one
      * that is currently unavailable, increment its failure counter; once the counter reaches
      * {@link #MAX_RECONNECT_FAILURES} the client is closed (which triggers
      * {@code closeFuture} → cache eviction). Healthy clients have their counter reset.
