@@ -44,11 +44,15 @@ import java.util.concurrent.atomic.AtomicInteger;
  *         scanner closes idle connections.</li>
  *     <li>A lightweight background timer periodically (every
  *         {@value #RECONNECT_CHECK_PERIOD_SECONDS}s) scans cached clients. If a client is found
- *         to be unavailable, its failure counter is incremented; once the counter reaches
- *         {@value #MAX_RECONNECT_FAILURES}, the client is closed and evicted, freeing memory and
- *         allowing the next request to rebuild a fresh long connection.</li>
- *     <li>When the underlying {@link RpcClient} closes itself (transport error or our own timer),
- *         the {@link RpcClient#closeFuture()} callback removes the cache entry.</li>
+ *         to be unavailable, its failure counter is incremented and a warning is logged. The
+ *         scanner <b>never actively closes</b> the underlying transport: doing so would tear
+ *         down its Netty {@code EventLoopGroup} (and any in-flight long-connection requests).
+ *         Recovery is delegated to the transport's existing lazy reconnect, which is triggered
+ *         by the request path ({@link com.tencent.trpc.core.transport.AbstractClientTransport
+ *         #ensureChannelActive}) or by Netty's {@code channelInactive} event.</li>
+ *     <li>When the underlying {@link RpcClient} closes itself (transport error or explicit
+ *         shutdown), the {@link RpcClient#closeFuture()} callback removes the cache entry so
+ *         the next request rebuilds a fresh long connection.</li>
  *     <li>{@link #shutdownBackendConfig(BackendConfig)} / {@link #close()} still release clients
  *         explicitly.</li>
  * </ul>
@@ -62,8 +66,9 @@ public class RpcClusterClientManager {
      */
     private static final int RECONNECT_CHECK_PERIOD_SECONDS = 30;
     /**
-     * Maximum number of consecutive reconnect-check failures tolerated before the client is
-     * closed and evicted from the cache.
+     * Maximum number of consecutive reconnect-check failures tolerated before a warning is
+     * escalated. The scanner will <b>not</b> close the client transport itself; recovery is
+     * delegated to the transport's lazy reconnect.
      */
     private static final int MAX_RECONNECT_FAILURES = 5;
 
@@ -180,12 +185,13 @@ public class RpcClusterClientManager {
 
     /**
      * Periodic check: walk every cached client; for each one
-     * that is currently unavailable, increment its failure counter; once the counter reaches
-     * {@link #MAX_RECONNECT_FAILURES} the client is closed (which triggers
-     * {@code closeFuture} → cache eviction). Healthy clients have their counter reset.
-     * <p>The check itself does not actively send a heartbeat: it simply observes the current
-     * connection state. The transport's existing lazy reconnect (triggered by request path or
-     * by Netty's channelInactive event) takes care of re-establishing the long connection.</p>
+     * that is currently unavailable, increment its failure counter and log a warning once the
+     * counter reaches {@link #MAX_RECONNECT_FAILURES}. Healthy clients have their counter reset.
+     * <p>The check itself does not actively send a heartbeat and <b>never closes the underlying
+     * transport</b>: closing would tear down the shared Netty {@code EventLoopGroup} and abort
+     * in-flight long-connection requests. The transport's existing lazy reconnect (triggered by
+     * request path or by Netty's {@code channelInactive} event) takes care of re-establishing
+     * the long connection.</p>
      */
     static void checkAndReconnect() {
         if (CLOSED_FLAG.get()) {
@@ -195,24 +201,29 @@ public class RpcClusterClientManager {
             try {
                 if (proxy.isAvailable()) {
                     proxy.failureCount.set(0);
+                    proxy.warnedAtMaxFailures.set(false);
                     return;
                 }
-                int fails = proxy.failureCount.incrementAndGet();
+                // Cap the counter at MAX_RECONNECT_FAILURES to avoid unbounded growth (and the
+                // resulting integer wrap-around) when the backend stays unavailable for a very
+                // long time. Once capped, further iterations are silent — the warning has
+                // already been emitted at the threshold-crossing iteration below.
+                int fails = proxy.failureCount.updateAndGet(
+                        cur -> cur >= MAX_RECONNECT_FAILURES ? MAX_RECONNECT_FAILURES : cur + 1);
                 if (logger.isDebugEnabled()) {
                     logger.debug("Reconnect-check: client {} not available, failureCount={}",
                             proxy.getProtocolConfig().toSimpleString(), fails);
                 }
-                if (fails >= MAX_RECONNECT_FAILURES) {
+                if (fails == MAX_RECONNECT_FAILURES
+                        && proxy.warnedAtMaxFailures.compareAndSet(false, true)) {
+                    // Log only once per unavailability spell to avoid log spam. The flag is
+                    // reset as soon as the proxy becomes available again (see the healthy
+                    // branch above is reached via a separate state, so we reset there too).
                     logger.warn("Reconnect-check: client {} unavailable for {} consecutive checks "
-                                    + "(~{}s), closing and evicting from cache",
+                                    + "(~{}s); leaving the transport intact and relying on lazy "
+                                    + "reconnect on the request path",
                             proxy.getProtocolConfig().toSimpleString(), fails,
                             fails * RECONNECT_CHECK_PERIOD_SECONDS);
-                    try {
-                        proxy.close();
-                    } catch (Throwable ex) {
-                        logger.error("Close stale client {} failed",
-                                proxy.getProtocolConfig().toSimpleString(), ex);
-                    }
                 }
             } catch (Throwable ex) {
                 logger.error("Reconnect-check on client {} threw", key, ex);
@@ -308,9 +319,16 @@ public class RpcClusterClientManager {
         private final RpcClient delegate;
         /**
          * Consecutive failure count observed by the reconnect-check timer; reset to 0 whenever
-         * the client is observed available.
+         * the client is observed available. Capped at {@link #MAX_RECONNECT_FAILURES} to avoid
+         * unbounded growth.
          */
         final AtomicInteger failureCount = new AtomicInteger(0);
+        /**
+         * Whether a "stuck unavailable" warning has already been emitted for the current
+         * unavailability spell. Reset to {@code false} as soon as the proxy is observed
+         * available again, so a future incident produces a fresh warning.
+         */
+        final AtomicBoolean warnedAtMaxFailures = new AtomicBoolean(false);
 
         RpcClientProxy(RpcClient delegate) {
             this.delegate = delegate;

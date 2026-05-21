@@ -12,8 +12,6 @@
 package com.tencent.trpc.transport.netty;
 
 import com.tencent.trpc.core.common.config.ProtocolConfig;
-import com.tencent.trpc.core.logger.Logger;
-import com.tencent.trpc.core.logger.LoggerFactory;
 import com.tencent.trpc.core.transport.ChannelHandler;
 import com.tencent.trpc.core.transport.codec.ClientCodec;
 import com.tencent.trpc.core.utils.NetUtils;
@@ -21,14 +19,21 @@ import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
+import io.netty.channel.EventLoopGroup;
 import io.netty.channel.FixedRecvByteBufAllocator;
+import io.netty.channel.epoll.EpollDatagramChannel;
+import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * A netty udp ClientTransport
+ * A netty udp ClientTransport. Honours {@code ioMode=epoll} for the datagram path the
+ * same way the TCP transport does, picking either {@link EpollDatagramChannel} +
+ * {@link EpollEventLoopGroup} or {@link NioDatagramChannel} + {@link NioEventLoopGroup}.
+ * The shared-group pool in {@link NettyAbstractClientTransport} is variant-aware, so
+ * mixing {@code ioThreadGroupShare=true} with {@code ioMode=epoll} is now legal.
  */
 public class NettyUdpClientTransport extends NettyAbstractClientTransport {
 
@@ -41,22 +46,32 @@ public class NettyUdpClientTransport extends NettyAbstractClientTransport {
         final NettyClientHandler clientHandler =
                 new NettyClientHandler(getChannelHandler(), config, false);
         this.bootstrap = new Bootstrap();
-        NioEventLoopGroup myEventLoopGroup;
-        if (!config.isIoThreadGroupShare()) {
+        boolean useEpoll = wantsEpoll(config);
+        EventLoopGroup myEventLoopGroup;
+        Class<? extends io.netty.channel.Channel> channelClass = useEpoll
+                ? EpollDatagramChannel.class
+                : NioDatagramChannel.class;
+        if (Boolean.TRUE.equals(config.isIoThreadGroupShare())) {
+            // Reference counter has already been incremented in the constructor; just use
+            // the shared group of the matching variant here. This avoids any TOCTOU race
+            // between constructor and doOpen.
+            myEventLoopGroup = getSharedEventLoopGroup();
+        } else if (useEpoll) {
+            myEventLoopGroup = new EpollEventLoopGroup(config.getIoThreads(),
+                    new DefaultThreadFactory(
+                            "Netty-EpollUdpClientWorker-" + config.getIp() + ":" + config.getPort()));
+        } else {
             myEventLoopGroup = new NioEventLoopGroup(config.getIoThreads(),
                     new DefaultThreadFactory(
                             "Netty-UdpClientWorker-" + config.getIp() + ":" + config.getPort()));
-        } else {
-            myEventLoopGroup = SHARE_EVENT_LOOP_GROUP;
-            SHARE_EVENT_LOOP_GROUP_USED_NUMS.incrementAndGet();
         }
         channelSet = clientHandler.getChannelSet();
-        bootstrap.channel(NioDatagramChannel.class).group(myEventLoopGroup)
+        bootstrap.channel(channelClass).group(myEventLoopGroup)
                 .option(ChannelOption.RCVBUF_ALLOCATOR,
                         new FixedRecvByteBufAllocator(config.getReceiveBuffer()))
-                .handler(new ChannelInitializer<NioDatagramChannel>() {
+                .handler(new ChannelInitializer<io.netty.channel.Channel>() {
                     @Override
-                    protected void initChannel(NioDatagramChannel ch) throws Exception {
+                    protected void initChannel(io.netty.channel.Channel ch) throws Exception {
                         ChannelPipeline p = ch.pipeline();
                         if (codec == null) {
                             p.addLast("handler", clientHandler);

@@ -219,11 +219,13 @@ public class RpcClusterClientManagerTest {
     }
 
     /**
-     * Direct invocation: client unavailable, failureCount accumulates and after MAX_RECONNECT_FAILURES
-     * the client is closed and evicted from the cache via the closeFuture hook.
+     * Direct invocation: client unavailable. failureCount accumulates across runs but the
+     * scanner must <b>not</b> close the underlying transport — closing would tear down the
+     * shared Netty EventLoopGroup and abort in-flight long-connection requests. The transport's
+     * lazy reconnect on the request path is the recovery mechanism.
      */
     @Test
-    public void testCheckAndReconnectUnavailableTriggersEviction() throws Exception {
+    public void testCheckAndReconnectUnavailableDoesNotEvict() throws Exception {
         BackendConfig backendConfig = new BackendConfig();
         backendConfig.setNamingUrl("ip://127.0.0.1:9006");
         ProtocolConfigTest config = new ProtocolConfigTest();
@@ -235,22 +237,18 @@ public class RpcClusterClientManagerTest {
         Map<BackendConfig, Map> clusterMap = (Map<BackendConfig, Map>) field.get(null);
         assertEquals(1, clusterMap.get(backendConfig).size());
 
-        // Run 4 times: failureCount grows but no eviction yet.
-        for (int i = 0; i < 4; i++) {
+        // Run well past MAX_RECONNECT_FAILURES. The proxy must NOT be closed and must remain in
+        // the cluster cache so long-connection traffic / lazy reconnect can resume.
+        for (int i = 0; i < 8; i++) {
             invokeCheckAndReconnect();
         }
-        assertEquals(4, getFailureCount(client));
-        assertEquals(1, clusterMap.get(backendConfig).size());
+        // failureCount is capped at MAX_RECONNECT_FAILURES (5) to avoid unbounded growth.
+        assertEquals(5, getFailureCount(client));
+        assertFalse("transport must not be closed by the scanner", config.closed.get());
+        assertEquals("client must remain cached for lazy reconnect",
+                1, clusterMap.get(backendConfig).size());
 
-        // 5th run hits MAX_RECONNECT_FAILURES, triggers proxy.close() → closeFuture →
-        // CLUSTER_MAP.remove(uniqId, proxy).
-        invokeCheckAndReconnect();
-        assertTrue(config.closed.get());
-        Map sub = clusterMap.get(backendConfig);
-        // Either the inner map is now empty or the entry was removed.
-        if (sub != null) {
-            assertEquals(0, sub.size());
-        }
+        RpcClusterClientManager.shutdownBackendConfig(backendConfig);
     }
 
     /**
@@ -266,7 +264,10 @@ public class RpcClusterClientManagerTest {
     }
 
     /**
-     * Drives the catch branch of checkAndReconnect's per-proxy try block: proxy.close() throws.
+     * The scanner's per-proxy try/catch must keep the loop alive even when the underlying
+     * proxy/state interactions throw. Since the scanner no longer actively closes the
+     * transport, this test simply verifies the scanner does not propagate exceptions and that
+     * failureCount keeps accumulating across iterations.
      */
     @Test
     public void testCheckAndReconnectSwallowsCloseException() throws Exception {
@@ -282,6 +283,8 @@ public class RpcClusterClientManagerTest {
         }
         // Must NOT throw out of the timer loop. Failure count should reach >= MAX (5).
         assertTrue(getFailureCount(client) >= 5);
+        // Scanner must NOT have closed the transport.
+        assertFalse(config.closed.get());
         RpcClusterClientManager.shutdownBackendConfig(backendConfig);
     }
 

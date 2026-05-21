@@ -36,7 +36,11 @@ public class Constants {
 
     public static final String DEFAULT_KEEP_ALIVE = "true";
     /**
-     * Default shared IO thread pool true
+     * Default shared IO thread pool: true. The shared pool now supports both NIO and
+     * Epoll: each transport joins one of two reference-counted shared groups based on
+     * {@code Epoll.isAvailable() && config.useEpoll()}, so enabling epoll no longer forces
+     * the user to also flip {@code ioThreadGroupShare} off. Server-side transports do not
+     * consult this flag (they always own their own group).
      */
     public static final String DEFAULT_IO_THREAD_GROUPSHARE = "true";
     /**
@@ -119,9 +123,34 @@ public class Constants {
      */
     public static final String DEFAULT_BUFFER_SIZE = "16384";
     /**
-     * Default client idle timeout 3 minutes
+     * Default client idle timeout 3 minutes. Drives the read-idle close handler installed
+     * by {@code NettyTcpClientTransport}: a long connection that has not received any
+     * inbound bytes for this duration is recycled by the client (the next request goes
+     * through lazy reconnect). Half-dead detection in faster paths is delegated to the
+     * configurable TCP keepalive parameters below; the read-idle handler is the slow
+     * universal fallback that also covers macOS / Windows where TCP keepalive tuning is
+     * not available.
      */
     public static final String DEFAULT_IDLE_TIMEOUT = "180000";
+    /**
+     * Default TCP keepalive idle (Linux {@code TCP_KEEPIDLE}) in seconds: 30 s without
+     * traffic on the socket before the kernel starts emitting keepalive probes. Together
+     * with {@link #DEFAULT_TCP_KEEPALIVE_INTVL} and {@link #DEFAULT_TCP_KEEPALIVE_CNT}
+     * (Dubbo-style 30/10/3) this yields a half-dead detection window of roughly 60 s on
+     * Linux + epoll (30 + 10 × 3 = 60). Value 0 leaves the OS default (Linux: 7200 s).
+     */
+    public static final String DEFAULT_TCP_KEEPALIVE_IDLE = "30";
+    /**
+     * Default TCP keepalive interval (Linux {@code TCP_KEEPINTVL}) in seconds between
+     * consecutive keepalive probes after the idle window has elapsed.
+     */
+    public static final String DEFAULT_TCP_KEEPALIVE_INTVL = "10";
+    /**
+     * Default TCP keepalive probe count (Linux {@code TCP_KEEPCNT}): the number of
+     * unacknowledged keepalive probes after which the kernel marks the connection dead
+     * and emits a RST.
+     */
+    public static final String DEFAULT_TCP_KEEPALIVE_CNT = "3";
     /**
      * Default server idle timeout 4 minutes
      */
