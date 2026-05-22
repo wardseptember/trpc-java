@@ -113,10 +113,12 @@ public class NettyTcpClientIdleCloseTest {
             try {
                 client.close();
             } catch (Throwable ignore) {
+                // best-effort cleanup
             }
             try {
                 server.close();
             } catch (Throwable ignore) {
+                // best-effort cleanup
             }
             acceptor.interrupt();
         }

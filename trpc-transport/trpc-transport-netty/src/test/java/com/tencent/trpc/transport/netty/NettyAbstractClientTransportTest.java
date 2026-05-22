@@ -63,9 +63,7 @@ public class NettyAbstractClientTransportTest {
      */
     @Test
     public void testNioSharedGroupReferenceCounting() {
-        ProtocolConfig c1 = newConfig(true, false);
-        ProtocolConfig c2 = newConfig(true, false);
-
+        final ProtocolConfig c1 = newConfig(true, false);
         NoopTransport t1 = new NoopTransport(c1);
         t1.open();
         assertEquals(1, NettyAbstractClientTransport.SHARE_NIO_USED_NUMS.get());
@@ -73,6 +71,7 @@ public class NettyAbstractClientTransportTest {
                 NettyAbstractClientTransport.SHARE_NIO_GROUP);
         EventLoopGroup grp = NettyAbstractClientTransport.SHARE_NIO_GROUP;
 
+        final ProtocolConfig c2 = newConfig(true, false);
         NoopTransport t2 = new NoopTransport(c2);
         t2.open();
         assertEquals(2, NettyAbstractClientTransport.SHARE_NIO_USED_NUMS.get());

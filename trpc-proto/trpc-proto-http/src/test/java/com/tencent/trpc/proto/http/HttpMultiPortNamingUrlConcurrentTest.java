@@ -71,6 +71,11 @@ public class HttpMultiPortNamingUrlConcurrentTest {
 
     private static ServerConfig serverConfig;
 
+    /**
+     * Spin up {@value #SERVER_COUNT} HTTP providers on contiguous ports. Each provider returns
+     * its own port number so the concurrent test can assert that requests are dispatched across
+     * every endpoint resolved from the multi-port {@code ip://} naming URL.
+     */
     @BeforeClass
     public static void startHttpServers() {
         ConfigManager.stopTest();

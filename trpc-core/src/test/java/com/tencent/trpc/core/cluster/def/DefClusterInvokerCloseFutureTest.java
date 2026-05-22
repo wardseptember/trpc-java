@@ -70,7 +70,7 @@ public class DefClusterInvokerCloseFutureTest {
         String key = "127.0.0.1:18001:tcp";
 
         TestRpcClient client = new TestRpcClient();
-        ConsumerInvokerProxy<GenericClient> proxy = new ConsumerInvokerProxy<>(
+        final ConsumerInvokerProxy<GenericClient> proxy = new ConsumerInvokerProxy<>(
                 stubInvoker(client.getProtocolConfig()), client);
         cache.put(key, proxy);
 
@@ -149,7 +149,7 @@ public class DefClusterInvokerCloseFutureTest {
     @Test
     public void testProxyIsAvailableTracksUnderlyingClient() {
         TestRpcClient client = new TestRpcClient();
-        ConsumerInvokerProxy<GenericClient> proxy = new ConsumerInvokerProxy<>(
+        final ConsumerInvokerProxy<GenericClient> proxy = new ConsumerInvokerProxy<>(
                 stubInvoker(client.getProtocolConfig()), client);
         Assert.assertTrue(proxy.isAvailable());
         client.available.set(false);
@@ -163,7 +163,7 @@ public class DefClusterInvokerCloseFutureTest {
     @Test
     public void testProxyInvokeFillsCallInfoAndReports() {
         TestRpcClient client = new TestRpcClient();
-        ConsumerInvokerProxy<GenericClient> proxy = new ConsumerInvokerProxy<>(
+        final ConsumerInvokerProxy<GenericClient> proxy = new ConsumerInvokerProxy<>(
                 stubInvoker(client.getProtocolConfig()), client);
 
         com.tencent.trpc.core.rpc.def.DefRequest request = new com.tencent.trpc.core.rpc.def.DefRequest();

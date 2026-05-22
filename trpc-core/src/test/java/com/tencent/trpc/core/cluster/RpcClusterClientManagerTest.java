@@ -207,7 +207,7 @@ public class RpcClusterClientManagerTest {
         BackendConfig backendConfig = new BackendConfig();
         backendConfig.setNamingUrl("ip://127.0.0.1:9005");
         ProtocolConfigTest config = new ProtocolConfigTest();
-        RpcClient client = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+        final RpcClient client = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
         invokeObserveHealth();
         // Healthy client must not be evicted.
         Field field = RpcClusterClientManager.class.getDeclaredField("CLUSTER_MAP");
@@ -230,7 +230,7 @@ public class RpcClusterClientManagerTest {
         backendConfig.setNamingUrl("ip://127.0.0.1:9006");
         ProtocolConfigTest config = new ProtocolConfigTest();
         config.available = false;
-        RpcClient client = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
+        final RpcClient client = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
 
         Field field = RpcClusterClientManager.class.getDeclaredField("CLUSTER_MAP");
         field.setAccessible(true);

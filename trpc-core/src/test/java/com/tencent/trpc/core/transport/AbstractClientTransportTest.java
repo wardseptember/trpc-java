@@ -89,6 +89,8 @@ public class AbstractClientTransportTest {
                     start.await();
                     m.invoke(transport, 0);
                 } catch (Exception ignore) {
+                    // concurrent invocations may race; the test only asserts on the
+                    // aggregate openCalls counter below
                 } finally {
                     done.countDown();
                 }

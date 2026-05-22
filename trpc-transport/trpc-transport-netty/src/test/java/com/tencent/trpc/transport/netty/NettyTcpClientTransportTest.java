@@ -121,13 +121,15 @@ public class NettyTcpClientTransportTest {
 
     /**
      * When {@code idleTimeout > 0}, {@code doOpen} must register both
-     * {@code idleState} and {@code idleClose} pipeline handlers. Driven via a real TCP
-     * connect against a throwaway {@link java.net.ServerSocket} so netty actually runs
-     * the {@code ChannelInitializer} and the assertions inspect a populated pipeline.
+     * {@code idleState} and {@code idleClose} pipeline handlers. Driven offline by
+     * reflecting on the {@link io.netty.channel.ChannelInitializer} captured in the
+     * bootstrap and invoking its {@code initChannel(Channel)} on a fresh
+     * {@link io.netty.channel.embedded.EmbeddedChannel}; no real socket / EventLoop is
+     * involved so the test is fully deterministic and isolated from JVM-level concurrency.
      */
     @Test
     public void testDoOpenInstallsIdlePipelineWhenEnabled() throws Exception {
-        ChannelPipeline pipeline = pipelineAfterRealConnect(180_000);
+        ChannelPipeline pipeline = pipelineAfterDoOpen(180_000);
         assertNotNull("idleState handler must be installed when idleTimeout > 0",
                 pipeline.get("idleState"));
         assertNotNull("idleClose handler must be installed when idleTimeout > 0",
@@ -140,7 +142,7 @@ public class NettyTcpClientTransportTest {
      */
     @Test
     public void testDoOpenSkipsIdlePipelineWhenDisabled() throws Exception {
-        ChannelPipeline pipeline = pipelineAfterRealConnect(0);
+        ChannelPipeline pipeline = pipelineAfterDoOpen(0);
         assertNull("idleState handler must NOT be installed when idleTimeout = 0",
                 pipeline.get("idleState"));
         assertNull("idleClose handler must NOT be installed when idleTimeout = 0",
@@ -195,68 +197,67 @@ public class NettyTcpClientTransportTest {
     }
 
     /**
-     * Stand up a throwaway plain {@link java.net.ServerSocket}, point a {@link NettyTcpClientTransport}
-     * at it with the given {@code idleTimeout}, force the lazy connect, and return the
-     * resulting pipeline of the connected netty channel. The server socket immediately
-     * accepts the connection and never writes anything, so READ_IDLE handlers (when
-     * installed) would eventually fire — but the test inspects the pipeline before that.
+     * Drive {@code doOpen} on a transport configured with the given {@code idleTimeout},
+     * pull the {@link io.netty.channel.ChannelInitializer} captured in the bootstrap and
+     * reflectively run its {@code initChannel(Channel)} against a fresh
+     * {@link io.netty.channel.embedded.EmbeddedChannel}. The resulting pipeline reflects
+     * exactly what production code would install on a real connected channel — no real
+     * socket / EventLoop / connect attempt is involved, so the result is deterministic
+     * regardless of host load or other tests running in the same JVM.
      */
-    private static ChannelPipeline pipelineAfterRealConnect(int idleTimeout) throws Exception {
-        java.net.ServerSocket server = new java.net.ServerSocket(0);
-        server.setSoTimeout(2000);
-        Thread accept = new Thread(() -> {
-            try {
-                java.net.Socket s = server.accept();
-                // Hold the socket; do not write anything. Closed implicitly when the
-                // accept thread exits.
-                Thread.sleep(1500);
-                try {
-                    s.close();
-                } catch (Throwable ignore) {
-                }
-            } catch (Throwable ignore) {
-                // Test may finish quickly and leave accept blocked — that's fine.
-            }
-        }, "test-accept");
-        accept.setDaemon(true);
-        accept.start();
-
+    private static ChannelPipeline pipelineAfterDoOpen(int idleTimeout) throws Exception {
         ProtocolConfig config = new ProtocolConfig();
-        config.setIp("127.0.0.1");
-        config.setPort(server.getLocalPort());
+        config.setIp(NetUtils.LOCAL_HOST);
+        // Port number is irrelevant — we never actually connect.
+        config.setPort(NetUtils.getAvailablePort());
         config.setNetwork("tcp");
         config.setConnsPerAddr(1);
-        config.setLazyinit(false);
+        // lazyinit=true: open() must NOT fire a real connect; we only need doOpen() so the
+        // bootstrap is configured with our ChannelInitializer.
+        config.setLazyinit(true);
         config.setKeepAlive(true);
         config.setIoThreadGroupShare(false);
         config.setIdleTimeout(idleTimeout);
 
-        NettyTcpClientTransport client = new NettyTcpClientTransport(config,
+        NettyTcpClientTransport transport = new NettyTcpClientTransport(config,
                 new ChannelHandlerAdapter(), new TransportClientCodecTest());
         try {
-            client.open();
-            // Drive the connect synchronously and capture the connected netty channel.
-            com.tencent.trpc.core.transport.Channel wrapper =
-                    client.getChannel().toCompletableFuture().get(2, java.util.concurrent.TimeUnit.SECONDS);
-            assertNotNull(wrapper);
-            assertTrue("channel must be connected", wrapper.isConnected());
-            // Pull the underlying io.netty.channel.Channel via reflection so we can grab
-            // the pipeline. NettyChannel keeps it as a private field "ioChannel".
-            java.lang.reflect.Field ioChannelField = wrapper.getClass()
-                    .getDeclaredField("ioChannel");
-            ioChannelField.setAccessible(true);
-            io.netty.channel.Channel ioChannel = (io.netty.channel.Channel) ioChannelField.get(wrapper);
-            return ioChannel.pipeline();
+            // open() runs through LifecycleObj → doOpen(); with lazyinit=true no connect
+            // is attempted. After this the bootstrap has our ChannelInitializer registered.
+            transport.open();
+            io.netty.channel.ChannelHandler initializer = transport.getBootstrap().config().handler();
+            assertNotNull("doOpen must register a ChannelInitializer", initializer);
+
+            // Use a fresh EmbeddedChannel as the target for the ChannelInitializer's
+            // initChannel(Channel) — we invoke it reflectively rather than via netty's
+            // own pipeline.add()/register() path so the result is fully deterministic and
+            // independent of any other tests / EventLoop state in the same JVM.
+            io.netty.channel.embedded.EmbeddedChannel ch = new io.netty.channel.embedded.EmbeddedChannel();
+            // The anonymous ChannelInitializer subclass declares exactly one
+            // initChannel(Channel) method — non-synthetic, non-bridge.
+            Method initChannel = null;
+            for (Method m : initializer.getClass().getDeclaredMethods()) {
+                if ("initChannel".equals(m.getName()) && m.getParameterCount() == 1
+                        && io.netty.channel.Channel.class.isAssignableFrom(m.getParameterTypes()[0])
+                        && !m.isSynthetic() && !m.isBridge()) {
+                    initChannel = m;
+                    break;
+                }
+            }
+            assertNotNull("ChannelInitializer must declare an initChannel(Channel) method",
+                    initChannel);
+            initChannel.setAccessible(true);
+            initChannel.invoke(initializer, ch);
+
+            // Return the live pipeline. NOTE: do NOT close the embedded channel — close()
+            // detaches every handler, which would invalidate {@code pipeline.get(name)}.
+            return ch.pipeline();
         } finally {
             try {
-                client.close();
+                transport.close();
             } catch (Throwable ignore) {
+                // best-effort cleanup; the assertions above already captured the result
             }
-            try {
-                server.close();
-            } catch (Throwable ignore) {
-            }
-            accept.interrupt();
         }
     }
 
