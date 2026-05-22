@@ -200,15 +200,15 @@ public class RpcClusterClientManagerTest {
     }
 
     /**
-     * Direct invocation of checkAndReconnect: client is healthy, failureCount stays at 0.
+     * Direct invocation of observeHealth: client is healthy, failureCount stays at 0.
      */
     @Test
-    public void testCheckAndReconnectHealthyClient() throws Exception {
+    public void testObserveHealthHealthyClient() throws Exception {
         BackendConfig backendConfig = new BackendConfig();
         backendConfig.setNamingUrl("ip://127.0.0.1:9005");
         ProtocolConfigTest config = new ProtocolConfigTest();
         RpcClient client = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
-        invokeCheckAndReconnect();
+        invokeObserveHealth();
         // Healthy client must not be evicted.
         Field field = RpcClusterClientManager.class.getDeclaredField("CLUSTER_MAP");
         field.setAccessible(true);
@@ -220,12 +220,12 @@ public class RpcClusterClientManagerTest {
 
     /**
      * Direct invocation: client unavailable. failureCount accumulates across runs but the
-     * scanner must <b>not</b> close the underlying transport — closing would tear down the
+     * observer must <b>not</b> close the underlying transport — closing would tear down the
      * shared Netty EventLoopGroup and abort in-flight long-connection requests. The transport's
      * lazy reconnect on the request path is the recovery mechanism.
      */
     @Test
-    public void testCheckAndReconnectUnavailableDoesNotEvict() throws Exception {
+    public void testObserveHealthUnavailableDoesNotEvict() throws Exception {
         BackendConfig backendConfig = new BackendConfig();
         backendConfig.setNamingUrl("ip://127.0.0.1:9006");
         ProtocolConfigTest config = new ProtocolConfigTest();
@@ -237,14 +237,14 @@ public class RpcClusterClientManagerTest {
         Map<BackendConfig, Map> clusterMap = (Map<BackendConfig, Map>) field.get(null);
         assertEquals(1, clusterMap.get(backendConfig).size());
 
-        // Run well past MAX_RECONNECT_FAILURES. The proxy must NOT be closed and must remain in
-        // the cluster cache so long-connection traffic / lazy reconnect can resume.
+        // Run well past STUCK_UNAVAILABLE_THRESHOLD. The proxy must NOT be closed and must
+        // remain in the cluster cache so long-connection traffic / lazy reconnect can resume.
         for (int i = 0; i < 8; i++) {
-            invokeCheckAndReconnect();
+            invokeObserveHealth();
         }
-        // failureCount is capped at MAX_RECONNECT_FAILURES (5) to avoid unbounded growth.
+        // failureCount is capped at STUCK_UNAVAILABLE_THRESHOLD (5) to avoid unbounded growth.
         assertEquals(5, getFailureCount(client));
-        assertFalse("transport must not be closed by the scanner", config.closed.get());
+        assertFalse("transport must not be closed by the observer", config.closed.get());
         assertEquals("client must remain cached for lazy reconnect",
                 1, clusterMap.get(backendConfig).size());
 
@@ -252,25 +252,24 @@ public class RpcClusterClientManagerTest {
     }
 
     /**
-     * checkAndReconnect must early-return when CLOSED_FLAG is true. Also ensures the close branch
-     * inside checkAndReconnect handles client.close() throwing without breaking the loop.
+     * observeHealth must early-return when CLOSED_FLAG is true.
      */
     @Test
-    public void testCheckAndReconnectShortCircuitsOnClosed() throws Exception {
+    public void testObserveHealthShortCircuitsOnClosed() throws Exception {
         RpcClusterClientManager.close();
         // Should not throw.
-        invokeCheckAndReconnect();
+        invokeObserveHealth();
         RpcClusterClientManager.reset();
     }
 
     /**
-     * The scanner's per-proxy try/catch must keep the loop alive even when the underlying
-     * proxy/state interactions throw. Since the scanner no longer actively closes the
-     * transport, this test simply verifies the scanner does not propagate exceptions and that
-     * failureCount keeps accumulating across iterations.
+     * The observer's per-proxy try/catch must keep the loop alive even when the underlying
+     * proxy/state interactions throw. Since the observer no longer actively closes the
+     * transport, this test simply verifies the observer does not propagate exceptions and
+     * that failureCount keeps accumulating across iterations.
      */
     @Test
-    public void testCheckAndReconnectSwallowsCloseException() throws Exception {
+    public void testObserveHealthSwallowsCloseException() throws Exception {
         BackendConfig backendConfig = new BackendConfig();
         backendConfig.setNamingUrl("ip://127.0.0.1:9007");
         ProtocolConfigTest config = new ProtocolConfigTest();
@@ -279,11 +278,11 @@ public class RpcClusterClientManagerTest {
         RpcClient client = RpcClusterClientManager.getOrCreateClient(backendConfig, config);
 
         for (int i = 0; i < 5; i++) {
-            invokeCheckAndReconnect();
+            invokeObserveHealth();
         }
-        // Must NOT throw out of the timer loop. Failure count should reach >= MAX (5).
+        // Must NOT throw out of the timer loop. Failure count should reach >= cap (5).
         assertTrue(getFailureCount(client) >= 5);
-        // Scanner must NOT have closed the transport.
+        // Observer must NOT have closed the transport.
         assertFalse(config.closed.get());
         RpcClusterClientManager.shutdownBackendConfig(backendConfig);
     }
@@ -377,17 +376,17 @@ public class RpcClusterClientManagerTest {
     }
 
     /**
-     * Lazy timer start: the first getOrCreateClient triggers ensureReconnectCheckerStarted; the
+     * Lazy timer start: the first getOrCreateClient triggers ensureHealthObserverStarted; the
      * future field becomes non-null. Calling getOrCreateClient again must NOT replace it.
      */
     @Test
-    public void testReconnectCheckerStartedLazilyAndOnce() throws Exception {
+    public void testHealthObserverStartedLazilyAndOnce() throws Exception {
         BackendConfig backendConfig = new BackendConfig();
         backendConfig.setNamingUrl("ip://127.0.0.1:9010");
         ProtocolConfigTest config = new ProtocolConfigTest();
         RpcClusterClientManager.getOrCreateClient(backendConfig, config);
 
-        Field f = RpcClusterClientManager.class.getDeclaredField("reconnectCheckerFuture");
+        Field f = RpcClusterClientManager.class.getDeclaredField("healthObserverFuture");
         f.setAccessible(true);
         Object first = f.get(null);
         assertNotNull("timer should be started", first);
@@ -402,8 +401,8 @@ public class RpcClusterClientManagerTest {
 
     /* ---------------------- helpers ---------------------- */
 
-    private static void invokeCheckAndReconnect() throws Exception {
-        Method m = RpcClusterClientManager.class.getDeclaredMethod("checkAndReconnect");
+    private static void invokeObserveHealth() throws Exception {
+        Method m = RpcClusterClientManager.class.getDeclaredMethod("observeHealth");
         m.setAccessible(true);
         m.invoke(null);
     }

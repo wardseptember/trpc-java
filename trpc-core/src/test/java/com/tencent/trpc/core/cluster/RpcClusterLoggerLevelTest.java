@@ -70,7 +70,7 @@ public class RpcClusterLoggerLevelTest {
      * <ul>
      *     <li>{@code shutdownBackendConfig} success path,</li>
      *     <li>{@code getOrCreateClient} closeFuture hook,</li>
-     *     <li>{@code checkAndReconnect} per-client failure log.</li>
+     *     <li>{@code observeHealth} per-client failure log.</li>
      * </ul>
      */
     @Test
@@ -87,12 +87,12 @@ public class RpcClusterLoggerLevelTest {
         StubProtocolConfig pConfig = new StubProtocolConfig();
 
         // (1) Triggers getOrCreateClient → eventually closeFuture hook (via shutdown below) and
-        //     (3) checkAndReconnect's failure-log path (since available is forced false next).
+        //     (3) observeHealth's failure-log path (since available is forced false next).
         RpcClient client = RpcClusterClientManager.getOrCreateClient(backendConfig, pConfig);
         org.junit.Assert.assertNotNull(client);
 
         pConfig.available = false;
-        invokeCheckAndReconnect();
+        invokeObserveHealth();
 
         // (2) shutdownBackendConfig success path.
         RpcClusterClientManager.shutdownBackendConfig(backendConfig);
@@ -126,8 +126,8 @@ public class RpcClusterLoggerLevelTest {
         return previous;
     }
 
-    private static void invokeCheckAndReconnect() throws Exception {
-        Method m = RpcClusterClientManager.class.getDeclaredMethod("checkAndReconnect");
+    private static void invokeObserveHealth() throws Exception {
+        Method m = RpcClusterClientManager.class.getDeclaredMethod("observeHealth");
         m.setAccessible(true);
         m.invoke(null);
     }

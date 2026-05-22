@@ -135,9 +135,14 @@ public class NettyTcpClientTransport extends NettyAbstractClientTransport {
                     // connection detection on platforms where TCP keepalive tuning is not
                     // available; on Linux + epoll the keepalive parameters above kick in
                     // first and recover the connection in seconds rather than minutes.
-                    p.addLast("idleState",
+                    //
+                    // The idle handlers MUST sit before {@code "handler"} (NettyClientHandler)
+                    // because the latter does not propagate {@code channelActive} downstream,
+                    // and IdleStateHandler relies on channelActive (or handlerAdded while
+                    // active) to start its timer.
+                    p.addBefore("handler", "idleState",
                             new IdleStateHandler(idleTimeoutMills, 0L, 0L, TimeUnit.MILLISECONDS));
-                    p.addLast("idleClose", new IdleCloseHandler());
+                    p.addBefore("handler", "idleClose", new IdleCloseHandler());
                 }
             }
         });
@@ -206,8 +211,19 @@ public class NettyTcpClientTransport extends NettyAbstractClientTransport {
         public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
             if (evt instanceof IdleStateEvent) {
                 io.netty.channel.Channel ioChannel = ctx.channel();
-                logger.info("Idle timeout fired on {}, closing channel and invalidating slot",
-                        ioChannel);
+                IdleStateEvent idleEvt = (IdleStateEvent) evt;
+                // Identifying info for ops triage:
+                //   * caller (this side): local socket address — uniquely identifies the
+                //     consumer process even when the framework-level CallerServiceName is
+                //     not propagated down to the transport layer.
+                //   * callee (peer side): config.toSimpleString() (name:protocol:ip:port:network)
+                //     plus the actual remote socket address, which captures DNS-resolved IP.
+                logger.info("[long-link][idle-fire] state={} caller(local)={} callee={} remote={} channelId={}",
+                        idleEvt.state(),
+                        ioChannel.localAddress(),
+                        config.toSimpleString(),
+                        ioChannel.remoteAddress(),
+                        ioChannel.id().asShortText());
                 try {
                     com.tencent.trpc.core.transport.Channel wrapper =
                             NettyChannelManager.getOrAddChannel(ioChannel, config);
@@ -215,9 +231,20 @@ public class NettyTcpClientTransport extends NettyAbstractClientTransport {
                         invalidateChannel(wrapper);
                     }
                 } catch (Throwable ex) {
-                    logger.warn("Invalidate slot for idle channel {} failed", ioChannel, ex);
+                    logger.warn("[long-link][idle-fire] invalidate slot failed, caller(local)={} "
+                                    + "callee={} remote={} channelId={}",
+                            ioChannel.localAddress(), config.toSimpleString(),
+                            ioChannel.remoteAddress(), ioChannel.id().asShortText(), ex);
                 }
-                ctx.close();
+                // Async close on the EventLoop; log when it actually completes so ops can
+                // tell apart "close enqueued" from "close finished".
+                ctx.close().addListener(future -> logger.info(
+                        "[long-link][idle-close] success={} caller(local)={} callee={} remote={} channelId={}"
+                                + (future.isSuccess() ? "" : " cause={}"),
+                        future.isSuccess(),
+                        ioChannel.localAddress(), config.toSimpleString(),
+                        ioChannel.remoteAddress(), ioChannel.id().asShortText(),
+                        future.isSuccess() ? null : future.cause()));
                 return;
             }
             super.userEventTriggered(ctx, evt);

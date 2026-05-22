@@ -13,7 +13,6 @@ package com.tencent.trpc.core.cluster;
 
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
-import static org.mockito.Mockito.when;
 
 import com.tencent.trpc.core.common.config.BackendConfig;
 import com.tencent.trpc.core.common.config.ConsumerConfig;
@@ -25,62 +24,67 @@ import com.tencent.trpc.core.rpc.RpcClient;
 import com.tencent.trpc.core.worker.WorkerPoolManager;
 import java.lang.reflect.Field;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.mockito.Mockito;
-import org.powermock.api.mockito.PowerMockito;
-import org.powermock.core.classloader.annotations.PowerMockIgnore;
-import org.powermock.core.classloader.annotations.PrepareForTest;
-import org.powermock.modules.junit4.PowerMockRunner;
 
 /**
  * Drives the {@code catch (Throwable)} branch in
- * {@link RpcClusterClientManager#ensureReconnectCheckerStarted()}: when the shared scheduler
+ * {@link RpcClusterClientManager#ensureHealthObserverStarted()}: when the shared scheduler
  * rejects the periodic task, the manager must swallow the exception and leave
- * {@code reconnectCheckerFuture} as {@code null}.
+ * {@code healthObserverFuture} as {@code null}.
+ *
+ * <p>Implemented without PowerMock — instead the {@code WorkerPoolManager.shareScheduler}
+ * static field is reflectively replaced with a {@link ScheduledThreadPoolExecutor} subclass
+ * whose {@code scheduleAtFixedRate} unconditionally throws
+ * {@link RejectedExecutionException}. Original scheduler is restored in {@code @After}.</p>
  */
-@RunWith(PowerMockRunner.class)
-@PrepareForTest({WorkerPoolManager.class})
-@PowerMockIgnore({"javax.management.*", "javax.security.*", "javax.ws.*", "javax.net.*"})
 public class RpcClusterSchedulerRejectTest {
+
+    private ScheduledThreadPoolExecutor originalScheduler;
 
     @Before
     public void setUp() throws Exception {
         RpcClusterClientManager.reset();
-        clearReconnectCheckerFuture();
+        clearHealthObserverFuture();
         clearClusterMap();
+        // Snapshot the live scheduler so we can put it back when the test ends.
+        Field f = WorkerPoolManager.class.getDeclaredField("shareScheduler");
+        f.setAccessible(true);
+        this.originalScheduler = (ScheduledThreadPoolExecutor) f.get(null);
+        f.set(null, new RejectingScheduler());
     }
 
     @After
     public void tearDown() throws Exception {
-        clearReconnectCheckerFuture();
+        // Restore the original scheduler before any other test in the same JVM observes
+        // a rejected one.
+        Field f = WorkerPoolManager.class.getDeclaredField("shareScheduler");
+        f.setAccessible(true);
+        f.set(null, originalScheduler);
+        clearHealthObserverFuture();
         clearClusterMap();
         RpcClusterClientManager.reset();
     }
 
     @Test
     public void testSchedulerExceptionCatchBranch() throws Exception {
-        ScheduledExecutorService rejecting = Mockito.mock(ScheduledExecutorService.class);
-        when(rejecting.scheduleAtFixedRate(Mockito.any(Runnable.class), Mockito.anyLong(),
-                Mockito.anyLong(), Mockito.any())).thenThrow(new RejectedExecutionException("rejected"));
-
-        PowerMockito.mockStatic(WorkerPoolManager.class);
-        PowerMockito.when(WorkerPoolManager.getShareScheduler()).thenReturn(rejecting);
-
         BackendConfig backendConfig = new BackendConfig();
         backendConfig.setNamingUrl("ip://127.0.0.1:9101");
-        // Must NOT propagate the RejectedExecutionException.
+        // Must NOT propagate the RejectedExecutionException — the manager has to swallow it
+        // and keep functioning, falling back to lazy reconnect on the request path only.
         RpcClient client = RpcClusterClientManager.getOrCreateClient(backendConfig,
                 new StubProtocolConfig());
         assertNotNull(client);
 
-        // Catch branch leaves reconnectCheckerFuture as null.
-        Field f = RpcClusterClientManager.class.getDeclaredField("reconnectCheckerFuture");
+        // Catch branch leaves healthObserverFuture as null.
+        Field f = RpcClusterClientManager.class.getDeclaredField("healthObserverFuture");
         f.setAccessible(true);
         assertNull("scheduler rejected → future must remain null", f.get(null));
 
@@ -95,13 +99,13 @@ public class RpcClusterSchedulerRejectTest {
         ((Map<?, ?>) f.get(null)).clear();
     }
 
-    private static void clearReconnectCheckerFuture() throws Exception {
-        Field f = RpcClusterClientManager.class.getDeclaredField("reconnectCheckerFuture");
+    private static void clearHealthObserverFuture() throws Exception {
+        Field f = RpcClusterClientManager.class.getDeclaredField("healthObserverFuture");
         f.setAccessible(true);
         Object cur = f.get(null);
         if (cur != null) {
             try {
-                ((java.util.concurrent.ScheduledFuture<?>) cur).cancel(true);
+                ((ScheduledFuture<?>) cur).cancel(true);
             } catch (Throwable ignore) {
                 // ignore
             }
@@ -110,6 +114,40 @@ public class RpcClusterSchedulerRejectTest {
     }
 
     /* ---------------- stubs ---------------- */
+
+    /**
+     * A {@link ScheduledThreadPoolExecutor} subclass that rejects every
+     * {@code scheduleAtFixedRate} call. {@code core=1} keeps the parent constructor happy
+     * without consuming real worker threads — the test never actually submits anything.
+     */
+    private static final class RejectingScheduler extends ScheduledThreadPoolExecutor {
+
+        RejectingScheduler() {
+            super(1);
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleAtFixedRate(Runnable command, long initialDelay,
+                long period, TimeUnit unit) {
+            throw new RejectedExecutionException("rejected by test stub");
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleWithFixedDelay(Runnable command, long initialDelay,
+                long delay, TimeUnit unit) {
+            throw new RejectedExecutionException("rejected by test stub");
+        }
+
+        @Override
+        public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
+            throw new RejectedExecutionException("rejected by test stub");
+        }
+
+        @Override
+        public <V> ScheduledFuture<V> schedule(Callable<V> callable, long delay, TimeUnit unit) {
+            throw new RejectedExecutionException("rejected by test stub");
+        }
+    }
 
     private static class StubProtocolConfig extends ProtocolConfig {
 
