@@ -43,7 +43,13 @@ import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.protocol.HttpContext;
 
 /**
- * HTTP protocol client invoker.
+ * HTTP/1.1 protocol client invoker.
+ *
+ * <p>Each {@link #send(Request)} entry signals the underlying {@link HttpRpcClient} that it
+ * is being used (drives the idle-eviction heuristic) and reports success / failure to drive
+ * the consecutive-failure counter that flips the client to unavailable on sustained backend
+ * outages. See {@link HttpRpcClient} for the cluster-side health observer that consumes these
+ * signals.</p>
  */
 public class HttpConsumerInvoker<T> extends AbstractConsumerInvoker<T> {
 
@@ -57,21 +63,40 @@ public class HttpConsumerInvoker<T> extends AbstractConsumerInvoker<T> {
      *
      * @param request TRPC request
      * @return TRPC response
-     * @throws Exception if send request failed
+     * @throws Exception declared to honour the abstract contract; the implementation never
+     *         lets exceptions escape — every failure path is wrapped into a Response with
+     *         {@code exception != null}.
      */
     @Override
     public Response send(Request request) throws Exception {
-        HttpPost httpPost = buildRequest(request);
-
         HttpRpcClient httpRpcClient = (HttpRpcClient) client;
-        // Refresh idle counter so the cluster manager's reconnect-check timer keeps treating
-        // this client as healthy while it's actively serving requests.
+        // Mark "used" before any work so even a failed request keeps the idle-eviction timer
+        // accurate (a failing client is still actively used and must not be reaped as orphan).
         httpRpcClient.markUsed();
-        CloseableHttpClient httpClient = httpRpcClient.getHttpClient();
 
-        try (CloseableHttpResponse httpResponse = httpClient.execute(httpPost)) {
-            return handleResponse(request, httpResponse);
+        HttpPost httpPost;
+        try {
+            httpPost = buildRequest(request);
         } catch (Exception ex) {
+            // buildRequest failure is a local programming error (URI / encoding / config).
+            // Count it as a failure for the consecutive-failure counter — sustained build
+            // failures should still surface via isAvailable().
+            httpRpcClient.markFailure();
+            return RpcUtils.newResponse(request, null, ex);
+        }
+
+        CloseableHttpClient httpClient = httpRpcClient.getHttpClient();
+        try (CloseableHttpResponse httpResponse = httpClient.execute(httpPost)) {
+            Response response = handleResponse(request, httpResponse);
+            if (response.getException() == null) {
+                httpRpcClient.markSuccess();
+            } else {
+                // Non-2xx surfaced as Response with biz exception; count toward eviction.
+                httpRpcClient.markFailure();
+            }
+            return response;
+        } catch (Exception ex) {
+            httpRpcClient.markFailure();
             return RpcUtils.newResponse(request, null, ex);
         }
     }

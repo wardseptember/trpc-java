@@ -15,7 +15,6 @@ package com.tencent.trpc.proto.http.client;
 import static com.tencent.trpc.core.common.Constants.DEFAULT_CLIENT_REQUEST_TIMEOUT_MS;
 import static com.tencent.trpc.proto.http.common.HttpConstants.CONNECTION_REQUEST_TIMEOUT;
 
-import autovalue.shaded.com.google.common.common.base.Objects;
 import com.tencent.trpc.core.common.config.BackendConfig;
 import com.tencent.trpc.core.common.config.ConsumerConfig;
 import com.tencent.trpc.core.common.config.ProtocolConfig;
@@ -29,6 +28,7 @@ import com.tencent.trpc.proto.http.common.HttpConstants;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import org.apache.hc.client5.http.async.methods.SimpleHttpRequest;
@@ -44,6 +44,11 @@ import org.apache.hc.core5.http.HttpStatus;
 
 /**
  * HTTP/2 protocol client invoker, supporting both h2 and http2c.
+ *
+ * <p>Each {@link #send(Request)} entry signals the underlying {@link Http2cRpcClient} that
+ * it is being used (drives the idle-eviction heuristic) and reports success / failure to
+ * drive the consecutive-failure counter that flips the client to unavailable on sustained
+ * backend outages.</p>
  */
 public class Http2ConsumerInvoker<T> extends AbstractConsumerInvoker<T> {
 
@@ -60,19 +65,38 @@ public class Http2ConsumerInvoker<T> extends AbstractConsumerInvoker<T> {
      *
      * @param request client request
      * @return Response
-     * @throws Exception if send request failed
+     * @throws Exception declared to honour the abstract contract; the implementation never
+     *         lets exceptions escape — every failure path is wrapped into a Response with
+     *         {@code exception != null}.
      */
     @Override
     public Response send(Request request) throws Exception {
+        Http2cRpcClient http2cRpcClient = (Http2cRpcClient) client;
+        // Mark "used" before any work so even a failed request keeps the idle-eviction timer
+        // accurate (a failing client is still actively used and must not be reaped as orphan).
+        http2cRpcClient.markUsed();
+
         int requestTimeout = config.getBackendConfig().getRequestTimeout();
-        SimpleHttpRequest simpleHttpRequest = buildRequest(request, requestTimeout);
+        SimpleHttpRequest simpleHttpRequest;
+        try {
+            simpleHttpRequest = buildRequest(request, requestTimeout);
+        } catch (Exception ex) {
+            http2cRpcClient.markFailure();
+            return RpcUtils.newResponse(request, null, ex);
+        }
 
         try {
             SimpleHttpResponse simpleHttpResponse = execute(request, requestTimeout,
-                    simpleHttpRequest);
-
-            return handleResponse(request, simpleHttpResponse);
+                    simpleHttpRequest, http2cRpcClient);
+            Response response = handleResponse(request, simpleHttpResponse);
+            if (response.getException() == null) {
+                http2cRpcClient.markSuccess();
+            } else {
+                http2cRpcClient.markFailure();
+            }
+            return response;
         } catch (Exception e) {
+            http2cRpcClient.markFailure();
             return RpcUtils.newResponse(request, null, e);
         }
 
@@ -132,15 +156,12 @@ public class Http2ConsumerInvoker<T> extends AbstractConsumerInvoker<T> {
      * @param request TRPC request
      * @param requestTimeout request timeout
      * @param simpleHttpRequest HTTP request
+     * @param http2cRpcClient already-resolved owning client (avoids a redundant cast)
      * @return HTTP response
      * @throws Exception if do HTTP request failed
      */
     private SimpleHttpResponse execute(Request request, int requestTimeout,
-            SimpleHttpRequest simpleHttpRequest) throws Exception {
-        Http2cRpcClient http2cRpcClient = (Http2cRpcClient) client;
-        // Refresh idle counter so the cluster manager's reconnect-check timer keeps treating
-        // this client as healthy while it's actively serving requests.
-        http2cRpcClient.markUsed();
+            SimpleHttpRequest simpleHttpRequest, Http2cRpcClient http2cRpcClient) throws Exception {
         CloseableHttpAsyncClient httpAsyncClient = http2cRpcClient.getHttpAsyncClient();
         Future<SimpleHttpResponse> httpResponseFuture = httpAsyncClient.execute(simpleHttpRequest,
                 new FutureCallback<SimpleHttpResponse>() {
@@ -210,7 +231,7 @@ public class Http2ConsumerInvoker<T> extends AbstractConsumerInvoker<T> {
         }
         // Set custom business headers, consistent with the TRPC protocol, only process String and byte[]
         request.getAttachments().forEach((k, v) -> {
-            if (Objects.equal(k, HttpHeaders.TRANSFER_ENCODING) || Objects.equal(k, HttpHeaders.CONTENT_LENGTH)) {
+            if (Objects.equals(k, HttpHeaders.TRANSFER_ENCODING) || Objects.equals(k, HttpHeaders.CONTENT_LENGTH)) {
                 return;
             }
             if (v instanceof String) {

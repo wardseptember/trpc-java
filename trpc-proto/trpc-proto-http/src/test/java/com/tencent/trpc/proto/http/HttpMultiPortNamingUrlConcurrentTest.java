@@ -25,6 +25,7 @@ import com.tencent.trpc.core.common.config.ServiceConfig;
 import com.tencent.trpc.core.rpc.RpcClientContext;
 import com.tencent.trpc.core.rpc.RpcContext;
 import com.tencent.trpc.core.utils.NetUtils;
+import com.tencent.trpc.proto.http.client.AbstractConsumerInvoker;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Set;
@@ -33,6 +34,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.AfterClass;
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import tests.service.GreeterService;
@@ -113,6 +115,16 @@ public class HttpMultiPortNamingUrlConcurrentTest {
             serverConfig = null;
         }
         ConfigManager.stopTest();
+    }
+
+    /**
+     * Reset the static {@code AbstractConsumerInvoker.TIMEOUT_MANAGER} so the {@code
+     * HashedWheelTimer} is fresh — sibling tests in the same surefire run may have
+     * stopped it via {@code ConfigManager.stopTest()}.
+     */
+    @Before
+    public void resetTimeoutManager() {
+        AbstractConsumerInvoker.reset();
     }
 
     @Test
